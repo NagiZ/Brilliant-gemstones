@@ -314,7 +314,7 @@ function renderGame() {
         <div class="noble-row">
           ${state.nobles.length
             ? state.nobles.map((noble) => `
-                <div class="noble-card">
+                <div class="noble-card" style="background-image:url('${noble.image}')">
                   <div class="noble-points">${noble.points}</div>
                   <div class="card-costs">${costBadges(noble.cost)}</div>
                 </div>
@@ -329,7 +329,7 @@ function renderGame() {
         <div class="bank-row">
           ${TOKEN_COLORS.map((color) => `
             <button
-              class="bank-pile"
+              class="bank-pile ${isGemSelected(color) ? 'selected' : ''}"
               data-action="bank-token"
               data-color="${color}"
               ${isBankSelectable(color) ? '' : 'disabled'}
@@ -340,6 +340,7 @@ function renderGame() {
             </button>
           `).join('')}
         </div>
+        ${!hasPendingForYou() ? renderGemActions(me, canAct) : ''}
       </div>
 
       ${[3, 2, 1].map((level) => renderLevel(level, canAct)).join('')}
@@ -364,15 +365,23 @@ function renderPlayerCard(player) {
         </div>
         <div class="score-badge">${player.score}</div>
       </div>
-      <div class="token-line">
-        ${tokensToChips(player.tokens, { small: true })}
+      <div class="player-stat">
+        <div class="player-stat-label">宝石</div>
+        <div class="token-line">
+          ${tokensToChips(player.tokens, { small: true })}
+        </div>
       </div>
-      <div class="token-line">
-        ${GEM_COLORS.map((color) => {
-          const count = player.bonuses[color] || 0;
-          if (!count) return '';
-          return `<span class="token-chip ${tokenClass(color)} small">${COLOR_LABELS[color]} ×${count}</span>`;
-        }).join('')}
+      <div class="player-stat">
+        <div class="player-stat-label">加成</div>
+        <div class="token-line">
+          ${GEM_COLORS.map((color) => {
+            const count = player.bonuses[color] || 0;
+            if (!count) return '';
+            return `<span class="token-chip ${tokenClass(color)} small"><img class="gem-icon" src="/assets/gem-${color}.svg" alt="" /><span class="chip-count">×${count}</span></span>`;
+          }).join('') || '<span class="muted small">—</span>'}
+        </div>
+      </div>
+      <div class="player-meta">
         <span class="token-chip small">保留 ${player.reservedCount}</span>
         <span class="token-chip small">贵族 ${player.nobles.length}</span>
       </div>
@@ -394,7 +403,15 @@ function isBankSelectable(color) {
   if (ui.mode === 'take2') {
     return GEM_COLORS.includes(color) && state.bank[color] >= 4;
   }
-  return false;
+  // 没有选择行动时，直接点击宝石进入“拿 3 枚不同色”的选择流程。
+  return GEM_COLORS.includes(color) && state.bank[color] > 0;
+}
+
+function isGemSelected(color) {
+  if (ui.mode === 'take2') {
+    return ui.selectedGems[0] === color;
+  }
+  return ui.selectedGems.includes(color);
 }
 
 function renderLevel(level, canAct) {
@@ -410,7 +427,7 @@ function renderLevel(level, canAct) {
       </div>
       <div class="cards-row">
         ${cards.map((card) => renderCard(card, canAct, me)).join('')}
-        <div class="deck-card">
+        <div class="deck-card" style="background-image:url('/assets/decks/deck${level}.jpg')">
           <div class="deck-count">${deckCount}</div>
           <button
             data-action="reserve-deck"
@@ -428,12 +445,8 @@ function renderCard(card, canAct, me) {
   const selected = ui.mode === 'reserve' && ui.selectedGems.includes(card.id);
 
   return `
-    <div class="card level-${card.level} ${selected ? 'selected' : ''}">
-      <div class="card-top">
-        <span class="card-points">${card.points}</span>
-        ${bonusDot(card.color)}
-      </div>
-      <div class="card-costs">${costBadges(card.cost)}</div>
+    <div class="card-slot">
+      <div class="card level-${card.level} card-photo ${selected ? 'selected' : ''}" style="background-image:url('${card.image}')"></div>
       ${
         canAct
           ? `
@@ -450,35 +463,22 @@ function renderCard(card, canAct, me) {
 
 function renderMyPanel(me, canAct) {
   const pendingDiscardForYou = state.pendingDiscard?.playerId === state.youId;
-  const selectionText = ui.mode
-    ? selectionHelpText()
-    : pendingDiscardForYou
-      ? `本回合结束时手牌宝石超过 10 枚，需要归还 ${state.pendingDiscard.count} 枚。`
-      : '选择一种行动：拿宝石、购买发展卡或保留卡牌。';
-  const canConfirmGems =
-    (ui.mode === 'take3' && ui.selectedGems.length === 3)
-    || (ui.mode === 'take2' && ui.selectedGems.length === 2);
 
   return `
     <div class="panel my-panel">
-      <div class="space-between">
-        <div>
-          <div class="section-title" style="margin: 0 0 8px;">我的手牌</div>
-          <div class="token-line">${tokensToChips(me.tokens)}</div>
-          <div class="muted small" style="margin-top: 8px;">手牌宝石总数：${sumTokens(me.tokens)} / 10</div>
-        </div>
-        ${!pendingDiscardForYou ? `
-          <div class="action-buttons">
-            <button data-action="take-three" ${canAct && canTakeThree() ? '' : 'disabled'}>拿 3 枚不同色</button>
-            <button data-action="take-two" ${canAct && canTakeTwo() ? '' : 'disabled'}>拿 2 枚同色</button>
-            <button data-action="cancel-mode" class="ghost" ${ui.mode ? '' : 'disabled'}>取消选择</button>
-          </div>
-        ` : ''}
+      <div class="section-title">
+        <span>我的手牌</span>
+        <span class="muted small">宝石 ${sumTokens(me.tokens)} / 10</span>
       </div>
-      <div class="selection-help" style="margin-top: 12px;">${selectionText}</div>
-      ${ui.mode && canConfirmGems ? `
-        <button class="primary" data-action="confirm-gems" style="margin-top: 10px;">确认拿取</button>
-      ` : ''}
+      <div class="hand-gems">
+        ${TOKEN_COLORS.map((color) => `
+          <div class="hand-gem">
+            <img class="gem-icon" src="/assets/gem-${color}.svg" alt="" />
+            <span class="hand-gem-count">${me.tokens[color] || 0}</span>
+            <span class="hand-gem-label">${COLOR_LABELS[color]}宝石</span>
+          </div>
+        `).join('')}
+      </div>
       ${pendingDiscardForYou ? renderDiscardPicker(me) : ''}
       <div class="section-title" style="margin-top: 18px;">
         <span>我保留的卡牌</span>
@@ -489,6 +489,40 @@ function renderMyPanel(me, canAct) {
           ? me.reserved.map((card) => renderReservedCard(card, me, canAct)).join('')
           : '<span class="muted small">尚未保留卡牌。</span>'}
       </div>
+    </div>
+  `;
+}
+
+function renderGemActions(me, canAct) {
+  const canConfirmGems =
+    (ui.mode === 'take3' && ui.selectedGems.length === 3)
+    || (ui.mode === 'take2' && ui.selectedGems.length === 2);
+
+  return `
+    <div class="gem-actions">
+      <div class="action-buttons compact">
+        <button
+          class="${ui.mode === 'take3' ? 'active' : ''}"
+          data-action="take-three"
+          ${canAct && canTakeThree() ? '' : 'disabled'}
+        >拿 3 枚不同色</button>
+        <button
+          class="${ui.mode === 'take2' ? 'active' : ''}"
+          data-action="take-two"
+          ${canAct && canTakeTwo() ? '' : 'disabled'}
+        >拿 2 枚同色</button>
+        <button
+          class="ghost"
+          data-action="cancel-mode"
+          ${ui.mode ? '' : 'disabled'}
+        >取消选择</button>
+      </div>
+      <div class="selection-help">
+        ${ui.mode ? selectionHelpText() : '点击上方宝石可直接开始选择；也可购买或保留发展卡。'}
+      </div>
+      ${canConfirmGems ? `
+        <button class="primary" data-action="confirm-gems">确认拿取</button>
+      ` : ''}
     </div>
   `;
 }
@@ -530,12 +564,8 @@ function renderDiscardPicker(me) {
 function renderReservedCard(card, me, canAct) {
   const affordable = canAfford(card, me);
   return `
-    <div class="card level-${card.level}">
-      <div class="card-top">
-        <span class="card-points">${card.points}</span>
-        ${bonusDot(card.color)}
-      </div>
-      <div class="card-costs">${costBadges(card.cost)}</div>
+    <div class="card-slot">
+      <div class="card level-${card.level} card-photo" style="background-image:url('${card.image}')"></div>
       ${
         canAct
           ? `
@@ -563,7 +593,7 @@ function renderPendingNoble(me) {
         <p>你的发展卡加成满足了多位贵族，请选择迎接一位。</p>
         <div class="noble-row" style="justify-content: center;">
           ${options.map((noble) => `
-            <button class="noble-card" data-action="choose-noble" data-noble-id="${noble.id}">
+            <button class="noble-card" data-action="choose-noble" data-noble-id="${noble.id}" style="background-image:url('${noble.image}')">
               <div class="noble-points">${noble.points}</div>
               <div class="card-costs">${costBadges(noble.cost)}</div>
             </button>
@@ -610,7 +640,10 @@ function selectionHelpText() {
     return `已选择 ${ui.selectedGems.length}/3 枚不同色宝石，点击上方供应区宝石选择，然后确认。`;
   }
   if (ui.mode === 'take2') {
-    return '选择一种库存至少 4 枚的宝石，一次拿取 2 枚。';
+    const color = ui.selectedGems[0];
+    return color
+      ? `已选择 ${COLOR_LABELS[color]}宝石 2 枚，点击确认拿取。`
+      : '选择一种库存至少 4 枚的宝石，一次拿取 2 枚。';
   }
   return '';
 }
@@ -699,6 +732,13 @@ async function leaveRoom() {
 
 function selectBankToken(color) {
   if (!isYourTurn() || hasPendingForYou()) return;
+
+  if (!ui.mode) {
+    ui.mode = 'take3';
+    ui.selectedGems = [color];
+    render();
+    return;
+  }
 
   if (ui.mode === 'take3') {
     if (!GEM_COLORS.includes(color)) return;

@@ -100,7 +100,7 @@ select:focus {
 }
 
 .screen {
-  animation: fade-in 0.2s ease;
+  animation: none;
 }
 
 @keyframes fade-in {
@@ -417,13 +417,41 @@ select:focus {
 }
 
 .noble-card {
+  position: relative;
   text-align: center;
+  min-height: 94px;
+  background-color: var(--panel-2);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
 .noble-points {
   color: var(--gold);
   font-weight: 800;
   font-size: 18px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 18, 31, 0.66);
+  position: absolute;
+  top: 6px;
+  left: 8px;
+}
+
+.noble-card .card-costs {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+  justify-content: center;
+  margin-top: 0;
+  padding: 3px 4px;
+  border-radius: 8px;
+  background: rgba(8, 18, 31, 0.66);
 }
 
 .bank-pile {
@@ -431,6 +459,12 @@ select:focus {
   justify-items: center;
   gap: 6px;
   min-width: 72px;
+}
+
+.bank-pile.selected {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 2px rgba(244, 197, 66, 0.28);
+  transform: translateY(-1px);
 }
 
 .bank-count {
@@ -451,13 +485,26 @@ select:focus {
 
 .cards-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(118px, 150px));
+  justify-content: center;
   gap: 10px;
+}
+
+.card-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-slot .card {
+  width: 100%;
 }
 
 .card {
   position: relative;
   min-height: 158px;
+  aspect-ratio: 3 / 4;
   padding: 10px;
   border-radius: 13px;
   background-color: #142338;
@@ -483,6 +530,11 @@ select:focus {
 .card.selected {
   border-color: var(--gold);
   box-shadow: 0 0 0 2px rgba(244, 197, 66, 0.35);
+}
+
+.card.card-photo {
+  background-color: #142338;
+  background-blend-mode: normal;
 }
 
 .card.level-1 {
@@ -548,23 +600,20 @@ select:focus {
 }
 
 .card-actions {
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 8px;
   display: flex;
   gap: 6px;
 }
 
 .card-actions button {
   flex: 1;
-  padding: 6px 4px;
+  padding: 7px 4px;
   border-radius: 7px;
   font-size: 11px;
 }
 
 .deck-card {
   min-height: 130px;
+  aspect-ratio: 3 / 4;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -582,10 +631,69 @@ select:focus {
 .deck-count {
   font-size: 28px;
   font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 7px;
+  background: rgba(3, 9, 18, 0.62);
 }
 
 .my-panel {
   margin-top: 16px;
+}
+
+.hand-gems {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 8px;
+}
+
+.hand-gem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 11px 6px;
+  border-radius: 12px;
+  background: #0f1c2b;
+  border: 1px solid var(--line);
+}
+
+.hand-gem .gem-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.hand-gem-count {
+  font-weight: 800;
+  font-size: 21px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.hand-gem-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.player-stat {
+  margin-top: 10px;
+}
+
+.player-stat-label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 5px;
+}
+
+.player-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .action-buttons {
@@ -597,6 +705,27 @@ select:focus {
 .action-buttons button {
   flex: 1;
   min-width: 150px;
+}
+
+.action-buttons.compact button {
+  flex: 0 1 auto;
+  min-width: 120px;
+}
+
+.action-buttons button.active {
+  border: 1px solid var(--gold);
+  color: var(--gold);
+  box-shadow: 0 0 0 1px rgba(244, 197, 66, 0.24);
+}
+
+.gem-actions {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+.gem-actions .primary {
+  justify-self: start;
 }
 
 .selection-help {
@@ -613,7 +742,7 @@ select:focus {
   gap: 10px;
 }
 
-.reserved-list .card {
+.reserved-list .card-slot {
   width: 142px;
   flex: 0 0 auto;
 }
@@ -684,18 +813,120 @@ select:focus {
 @media (max-width: 720px) {
   .app-shell {
     width: min(100% - 16px, 1460px);
-    padding-top: 10px;
+    padding: 10px 0 24px;
+  }
+
+  .lobby {
+    margin-top: 4vh;
+  }
+
+  .panel {
+    padding: 12px;
+    border-radius: 14px;
+  }
+
+  button {
+    min-height: 44px;
+  }
+
+  .game-header {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .game-header .row {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .turn-chip {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+
+  .players-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .player-card {
+    padding: 10px;
+  }
+
+  .bank-row,
+  .noble-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .bank-pile,
+  .noble-card {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .bank-gem {
+    width: 36px;
+    height: 36px;
+  }
+
+  .noble-card {
+    min-height: 78px;
   }
 
   .cards-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
   }
 
   .card {
-    min-height: 152px;
+    min-height: 0;
   }
 
-  .action-buttons button {
-    min-width: 130px;
+  .card-actions button {
+    font-size: 12px;
+    padding: 9px 4px;
+  }
+
+  .deck-card button {
+    width: 100%;
+    font-size: 12px;
+    padding: 9px 6px;
+  }
+
+  .action-buttons {
+    flex-direction: column;
+  }
+
+  .action-buttons button,
+  .action-buttons.compact button {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .gem-actions .primary {
+    justify-self: stretch;
+  }
+
+  .hand-gems {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .reserved-list .card-slot {
+    width: calc(50% - 5px);
+  }
+
+  .overlay {
+    align-items: flex-start;
+    overflow-y: auto;
+    padding: 12px;
+  }
+
+  .overlay-panel {
+    width: 100%;
   }
 }
