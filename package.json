@@ -1,7 +1,7 @@
 {
-  "name": "splendor-web",
-  "version": "1.0.0",
-  "description": "璀璨宝石（Splendor）在线多人 Web 版",
+  "name": "prism-guild",
+  "version": "2.0.0",
+  "description": "棱境商会，支持 2–4 人联机的原创宝石桌游",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -1,905 +1,674 @@
 'use strict';
 
-const GEM_COLORS = ['white', 'blue', 'green', 'red', 'black'];
-const TOKEN_COLORS = [...GEM_COLORS, 'gold'];
-const COLOR_LABELS = {
-  white: '白',
-  blue: '蓝',
-  green: '绿',
-  red: '红',
-  black: '黑',
-  gold: '金'
-};
-const LEVEL_LABELS = {
-  1: '一级发展卡',
-  2: '二级发展卡',
-  3: '三级发展卡'
-};
-
-const app = document.getElementById('app');
-const toast = document.getElementById('toast');
-
-const session = {
-  roomId: localStorage.getItem('splendor_room_id') || '',
-  playerId: localStorage.getItem('splendor_player_id') || ''
-};
-
+const COLORS = ['white', 'blue', 'green', 'red', 'black'];
+const ALL_COLORS = [...COLORS, 'gold'];
+const LABEL = { white: '月白', blue: '潮蓝', green: '松绿', red: '珊红', black: '暮紫', gold: '金砂' };
+const LEVEL = { 1: '基础', 2: '精工', 3: '典藏' };
+const app = document.querySelector('#app');
+const toast = document.querySelector('#toast');
+const invite = (new URL(location.href).searchParams.get('room') || '').toUpperCase();
+const savedRoom = localStorage.getItem('guild_room');
+let session = !invite || invite === savedRoom
+  ? { roomId: savedRoom, key: localStorage.getItem('guild_key') }
+  : null;
 let state = null;
-let eventSource = null;
+let stream = null;
+let connected = false;
+let busy = false;
+let joining = false;
+let chatBusy = false;
+let lobbyTab = /^[0-9A-F]{8}$/.test(invite) ? 'join' : 'create';
+let selection = [];
+let selectionMode = 'split';
+let returns = [];
+let lastMessageId = 0;
+let unread = 0;
+let mobileChatOpen = false;
+let toastTimer;
+const desktop = matchMedia('(min-width: 1000px)');
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const timeFormat = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+const soundtrack = new Audio();
+soundtrack.preload = 'none';
+soundtrack.loop = true;
+soundtrack.volume = 0.38;
+soundtrack.src = '/media/workshop-at-night.mp3';
 
-const ui = {
-  tab: 'create',
-  mode: null,
-  selectedGems: [],
-  returnSelection: []
-};
+const esc = value => String(value ?? '').replace(/[&<>"']/g, char =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]
+);
+const gem = color => `<i class="gem gem-${color}" aria-hidden="true"></i>`;
+const you = () => state.players.find(player => player.id === state.youId);
+const myTurn = () => state?.status === 'playing' && state.currentId === state.youId;
+const canAct = () => myTurn() && !state.returnCount && connected && !busy;
+const count = (colors, color) => colors.filter(item => item === color).length;
+const disabled = value => value ? 'disabled' : '';
+const roomPath = (command = '') => `/api/rooms/${session.roomId}${command ? '/' + command : ''}`;
 
-function tokenClass(color) {
-  return `token-${color}`;
+function notify(text, error = false) {
+  toast.textContent = text;
+  toast.classList.toggle('error', error);
+  toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.hidden = true; }, 3300);
 }
 
-function tokenChipHtml(color, count, opts = {}) {
-  const label = COLOR_LABELS[color];
-  const smallClass = opts.small ? ' small' : '';
-  const icon = `<img class="gem-icon" src="/assets/gem-${color}.svg" alt="" />`;
-  return `<span class="token-chip ${tokenClass(color)}${smallClass}" title="${label}宝石">${icon}<span class="chip-label">${label}</span>${opts.showCount === false ? '' : `<span class="chip-count">${count}</span>`}</span>`;
-}
-
-function tokensToChips(tokens, opts = {}) {
-  return TOKEN_COLORS.map((color) => {
-    const count = tokens[color] || 0;
-    if (!opts.showZero && count === 0) return '';
-    return tokenChipHtml(color, count, opts);
-  }).join('');
-}
-
-function costBadges(cost) {
-  return Object.keys(cost || {})
-    .filter((color) => cost[color] > 0)
-    .map((color) => {
-      const dot = `<img class="gem-icon cost-gem" src="/assets/gem-${color}.svg" alt="" />`;
-      return `<span class="cost-item">${dot}${cost[color]}</span>`;
-    })
-    .join('');
-}
-
-function bonusDot(color) {
-  return `<img class="card-bonus" src="/assets/gem-${color}.svg" alt="" title="${COLOR_LABELS[color]}加成" />`;
-}
-
-function cardCostAfterDiscount(card, player) {
-  const cost = {};
-  for (const color of GEM_COLORS) {
-    cost[color] = Math.max(0, (card.cost[color] || 0) - (player.bonuses[color] || 0));
-  }
-  return cost;
-}
-
-function canAfford(card, player) {
-  const cost = cardCostAfterDiscount(card, player);
-  const missing = GEM_COLORS.reduce(
-    (sum, color) => sum + Math.max(0, cost[color] - (player.tokens[color] || 0)),
-    0
-  );
-  return missing <= (player.tokens.gold || 0);
-}
-
-function sumTokens(tokens) {
-  return TOKEN_COLORS.reduce((sum, color) => sum + (tokens[color] || 0), 0);
-}
-
-function canTakeThree() {
-  return GEM_COLORS.filter((color) => state.bank[color] > 0).length >= 3;
-}
-
-function canTakeTwo() {
-  return GEM_COLORS.some((color) => state.bank[color] >= 4);
-}
-
-function currentPlayer() {
-  return state.players.find((player) => player.id === state.currentPlayerId);
-}
-
-function you() {
-  return state.players.find((player) => player.id === state.youId);
-}
-
-function isYourTurn() {
-  return state.status === 'playing' && state.currentPlayerId === state.youId;
-}
-
-function hasPendingForYou() {
-  return state.pendingDiscard?.playerId === state.youId
-    || state.pendingNoble?.playerId === state.youId;
-}
-
-function showToast(message, isError = false) {
-  toast.textContent = message;
-  toast.className = `toast show${isError ? ' error' : ''}`;
-  window.clearTimeout(showToast.timeout);
-  showToast.timeout = window.setTimeout(() => {
-    toast.className = 'toast';
-  }, 2600);
-}
-
-async function api(path, options = {}) {
+async function api(path, body, key) {
   const response = await fetch(path, {
-    method: options.method || 'GET',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(key ? { Authorization: 'Bearer ' + key } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body)
   });
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.error || '请求失败');
+    const error = new Error(data.error);
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
 
-function saveSession(roomId, playerId) {
-  session.roomId = roomId;
-  session.playerId = playerId;
-  localStorage.setItem('splendor_room_id', roomId);
-  localStorage.setItem('splendor_player_id', playerId);
+function brand() {
+  return '<div class="brand"><i class="brand-mark" aria-hidden="true"></i><span>棱境商会</span></div>';
 }
 
-function clearSession() {
-  session.roomId = '';
-  session.playerId = '';
-  localStorage.removeItem('splendor_room_id');
-  localStorage.removeItem('splendor_player_id');
+function musicControl() {
+  return `<button class="music-toggle" type="button" data-action="music" aria-label="工坊配乐" aria-pressed="${!soundtrack.paused}" title="工坊夜曲 · 播放或暂停">
+    <span class="music-glyph" aria-hidden="true">♫</span><span class="music-label" aria-hidden="true">音乐</span>
+  </button>`;
 }
 
-function connectEvents() {
-  if (!session.roomId || !session.playerId) return;
-  if (eventSource) eventSource.close();
+function syncMusicControl() {
+  document.querySelector('.music-toggle')?.setAttribute('aria-pressed', String(!soundtrack.paused));
+}
 
-  eventSource = new EventSource(
-    `/api/rooms/${encodeURIComponent(session.roomId)}/events?playerId=${encodeURIComponent(session.playerId)}`
-  );
+soundtrack.addEventListener('play', syncMusicControl);
+soundtrack.addEventListener('pause', syncMusicControl);
 
-  eventSource.addEventListener('state', (event) => {
-    state = JSON.parse(event.data);
-    ui.mode = null;
-    ui.selectedGems = [];
-    ui.returnSelection = [];
-    render();
-  });
+async function toggleMusic() {
+  if (!soundtrack.paused) {
+    soundtrack.pause();
+    syncMusicControl();
+    return;
+  }
+  try {
+    if (soundtrack.error) soundtrack.load();
+    const playing = soundtrack.play();
+    syncMusicControl();
+    await playing;
+  } catch (error) {
+    if (error.name !== 'AbortError') notify('配乐暂时无法播放，请重试。', true);
+  } finally {
+    syncMusicControl();
+  }
+}
 
-  eventSource.onerror = () => {
-    // EventSource 会自动重连；仅提示一次轻量连接状态。
+function renderLobby(name = localStorage.getItem('guild_name') || '', reconnect = false) {
+  const create = lobbyTab === 'create';
+  app.innerHTML = `
+    <header class="site-header"><div class="header-inner">${brand()}${musicControl()}</div></header>
+    <main class="lobby">
+      <section class="welcome">
+        <div class="welcome-copy"><h1>棱境商会</h1><p>采集宝石，制作作品，完成商会委托。</p></div>
+      </section>
+      <section class="entry panel">
+        ${reconnect ? '<h2>正在返回房间…</h2>' : `
+          <div class="entry-switch">
+            <button type="button" data-action="tab" data-tab="create" aria-pressed="${create}">创建房间</button>
+            <button type="button" data-action="tab" data-tab="join" aria-pressed="${!create}">加入房间</button>
+          </div>
+          <form id="entry-form" data-form="${lobbyTab}">
+            <label for="nickname">昵称</label>
+            <input id="nickname" name="name" maxlength="20" autocomplete="nickname" value="${esc(name)}" placeholder="输入你的昵称" required>
+            ${create ? `
+              <label for="capacity">房间上限</label>
+              <select id="capacity" name="capacity"><option value="2">2 人</option><option value="3">3 人</option><option value="4" selected>4 人</option></select>` : `
+              <label for="room-code">房间码</label>
+              <input id="room-code" name="room" maxlength="8" pattern="[A-Fa-f0-9]{8}" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="输入 8 位房间码" value="${esc(invite)}" required>`}
+            <button class="primary" type="submit">${create ? '创建房间' : '加入房间'}</button>
+          </form>`}
+      </section>
+    </main>`;
+}
+
+function mountRoom() {
+  selection = [];
+  selectionMode = 'split';
+  returns = [];
+  lastMessageId = 0;
+  unread = 0;
+  mobileChatOpen = false;
+  app.innerHTML = `
+    <header class="site-header">
+      <div class="header-inner">${brand()}
+        <div class="header-actions">
+          <span id="connection" role="status"></span>
+          ${musicControl()}
+          <button class="room-code" data-action="invite" title="复制邀请链接"><span>邀请</span><b>${esc(session.roomId)}</b></button>
+        </div>
+      </div>
+    </header>
+    <main class="room-layout">
+      <div id="table"></div>
+      <aside class="sidebar">
+        <section class="panel players"><div class="section-head"><h2>席位</h2><span id="seat-count" class="muted"></span></div><div id="players"></div></section>
+        <section class="panel chat" aria-labelledby="chat-title" id="chat">
+          <div class="section-head"><h2 id="chat-title">房间聊天</h2><button class="chat-close" data-action="chat-toggle" aria-label="关闭聊天">×</button></div>
+          <div class="messages" id="messages" role="log" aria-label="聊天消息" tabindex="0"><p class="empty">还没有消息。</p></div>
+          <form data-form="chat" class="chat-form">
+            <input name="message" maxlength="300" autocomplete="off" aria-label="聊天消息" placeholder="发给同桌玩家…" required>
+            <button type="submit" class="primary" id="chat-send">发送</button>
+          </form>
+        </section>
+      </aside>
+    </main>
+    <button class="chat-toggle primary" data-action="chat-toggle" aria-expanded="false" aria-controls="chat">聊天 <span id="unread" hidden></span></button>`;
+}
+
+function update(id, html) {
+  const element = document.getElementById(id);
+  if (element && element.rendered !== html) {
+    element.innerHTML = html;
+    element.rendered = html;
+  }
+}
+
+function showConnection() {
+  const element = document.querySelector('#connection');
+  if (!element) return;
+  element.classList.toggle('online', connected);
+  element.textContent = connected ? '已连接' : '正在连接';
+  document.querySelector('#chat-send').disabled = !connected || chatBusy;
+}
+
+function acceptState(next) {
+  if (state && next.revision <= state.revision) return;
+  const transfers = captureTransfers(state, next);
+  selection = [];
+  selectionMode = 'split';
+  returns = [];
+  state = next;
+  renderRoom();
+  transfers.forEach(animateTransfer);
+}
+
+function captureTransfers(before, after) {
+  if (reducedMotion.matches || before?.status !== 'playing' || after.revision !== before.revision + 1) return [];
+  const player = before.players.find(item => item.id === before.currentId);
+  const updated = after.players.find(item => item.id === player.id);
+  if (!updated) return [];
+  const own = player.id === before.youId;
+  const seat = document.getElementById('seat-' + player.id);
+  const transfers = [];
+
+  for (const color of ALL_COLORS) {
+    const gained = Math.min(updated.tokens[color] - player.tokens[color], before.bank[color] - after.bank[color]);
+    if (gained <= 0) continue;
+    const gem = document.querySelector(`.pile[data-color="${color}"] .gem`);
+    if (!gem) continue;
+    for (let i = 0; i < gained; i += 1) {
+      transfers.push({
+        kind: 'gem',
+        piece: gem.cloneNode(),
+        from: gem.getBoundingClientRect(),
+        destination: own ? '#stock-tokens' : '#seat-' + player.id + ' .seat-tokens',
+        color
+      });
+    }
+  }
+
+  const crafted = COLORS.find(color => updated.bonuses[color] > player.bonuses[color]);
+  const reserved = updated.reservedCount > player.reservedCount;
+  if (crafted || reserved) {
+    const marketCard = Object.values(before.market).flat().find(card =>
+      card && !after.market[card.level].some(item => item?.id === card.id)
+    );
+    const heldCard = crafted && player.reserved.find(card => !updated.reserved.some(item => item.id === card.id));
+    const removed = marketCard || heldCard;
+    const work = removed && document.getElementById('card-' + removed.id);
+    const face = work?.querySelector('.work-face');
+    const deckLevel = reserved && [1, 2, 3].find(level => after.deckCounts[level] < before.deckCounts[level]);
+    const source = face || (deckLevel && document.getElementById('deck-' + deckLevel)) || seat?.querySelector('.seat-reserved');
+    if (source) {
+      const piece = work ? work.cloneNode(false) : document.createElement('div');
+      if (face) {
+        piece.removeAttribute('id');
+        piece.append(face.cloneNode(true));
+      } else piece.className = 'flight-back';
+      transfers.push({
+        kind: 'card',
+        piece,
+        from: source.getBoundingClientRect(),
+        destination: crafted && own ? '#stock-bonuses' : '#seat-' + player.id + (crafted ? ' .seat-bonuses' : ' .seat-reserved'),
+        color: crafted
+      });
+    }
+  }
+  return transfers;
+}
+
+function animateTransfer({ kind, piece, from, destination, color }, index) {
+  const group = document.querySelector(destination);
+  const target = (color && group?.querySelector(`.fee[data-color="${color}"]`)) || group;
+  if (!target || !from.width || !from.height || reducedMotion.matches || !piece.animate) return;
+  const to = target.getBoundingClientRect();
+  const width = piece.classList.contains('flight-back') ? 46 : from.width;
+  const height = piece.classList.contains('flight-back') ? 58 : from.height;
+  const x = rect => Math.max(16, Math.min(innerWidth - 16, rect.left + rect.width / 2));
+  const y = rect => Math.max(16, Math.min(innerHeight - 16, rect.top + rect.height / 2));
+  const dx = x(to) - x(from);
+  const dy = y(to) - y(from);
+  const card = kind === 'card';
+  const arc = Math.min(card ? 86 : 48, Math.hypot(dx, dy) * 0.19);
+  piece.classList.add('move-flight', `move-flight-${kind}`);
+  piece.setAttribute('aria-hidden', 'true');
+  Object.assign(piece.style, { left: `${x(from) - width / 2}px`, top: `${y(from) - height / 2}px`, width: `${width}px`, height: `${height}px` });
+  app.append(piece);
+  const spin = dx >= 0 ? 1 : -1;
+  const animation = piece.animate([
+    { transform: 'translate(0, 0) scale(1)', opacity: 1, easing: 'cubic-bezier(.28, .02, .57, 1)' },
+    { transform: `translate(${dx * .5}px, ${dy * .5 - arc}px) rotate(${spin * (card ? 11 : 23)}deg) scale(${card ? .83 : 1.12})`, opacity: 1, offset: .57, easing: 'cubic-bezier(.3, .03, .38, 1)' },
+    { transform: `translate(${dx}px, ${dy}px) scale(${card ? .16 : .38})`, opacity: 0 }
+  ], { duration: card ? 780 : 510, delay: index * 70 });
+  animation.onfinish = () => {
+    if (!piece.isConnected) return;
+    piece.remove();
+    if (target.isConnected) target.animate([
+      { backgroundColor: 'rgba(250, 217, 155, .42)' },
+      { backgroundColor: 'rgba(250, 217, 155, 0)' }
+    ], { duration: 410, easing: 'ease-out' });
   };
 }
 
-function render() {
-  if (!state) {
-    renderLobby();
-    return;
-  }
-
+function renderRoom() {
+  showConnection();
+  if (!state) return;
+  update('seat-count', `${state.players.length} / ${state.capacity}`);
+  update('players', state.players.map(player => `
+    <div id="seat-${esc(player.id)}" class="seat ${player.id === state.currentId ? 'active' : ''}">
+      <div class="seat-line"><div class="avatar">${esc(Array.from(player.name)[0])}</div>
+        <div class="seat-name"><strong>${esc(player.name)}</strong><small>${[
+          player.id === state.youId ? '你' : '',
+          player.id === state.hostId ? '房主' : '',
+          player.id === state.currentId ? '行动中' : ''
+        ].filter(Boolean).join(' · ')}</small></div>
+        ${state.status === 'waiting' ? '' : `<b class="seat-score">${player.score}<small> 分</small></b>`}
+      </div>
+      ${state.status === 'waiting' ? '' : `<div class="seat-resources">
+        <span class="seat-tokens" title="持有的宝石">宝石 ${costs(player.tokens)}</span>
+        <span class="seat-bonuses" title="制作作品带来的加成">加成 ${costs(player.bonuses)}</span>
+        <span class="seat-reserved">保留 ${player.reservedCount}</span>
+      </div>`}
+    </div>`).join(''));
   if (state.status === 'waiting') {
-    renderWaitingRoom();
+    update('table', `<section class="waiting panel">
+      <div class="waiting-art" aria-hidden="true">${gem('green')}${gem('blue')}${gem('gold')}</div>
+      <h1>等待开局</h1><p>分享邀请链接，至少两人入席后即可开局。</p>
+      <div class="waiting-actions">
+        <button data-action="invite">复制邀请链接</button>
+        <button class="primary" data-action="start" ${disabled(state.youId !== state.hostId || state.players.length < 2 || busy || !connected)}>${state.youId === state.hostId ? '开始对局' : '等待房主开局'}</button>
+      </div>
+      <button class="quiet" data-action="leave" ${disabled(busy)}>退出房间</button>
+    </section>`);
     return;
   }
 
-  renderGame();
-}
-
-function renderLobby() {
-  const createActive = ui.tab === 'create';
-  app.innerHTML = `
-    <section class="screen lobby">
-      <div class="hero">
-        <h1>璀璨宝石</h1>
-        <p>Splendor 在线联机版 · 最多 4 名玩家</p>
+  update('table', `
+    <div id="status" class="turn-banner"></div>
+    <section class="panel supply" aria-labelledby="supply-title">
+      <div class="section-head"><h2 id="supply-title">宝石库</h2><span class="muted" id="supply-hint"></span></div>
+      <div id="piles" class="piles">${ALL_COLORS.map(color => `<button data-action="gem" data-color="${color}" class="pile" aria-pressed="false">${gem(color)}<span>${LABEL[color]}</span><strong>0</strong></button>`).join('')}</div>
+      <div class="supply-controls">
+        <div class="modes" aria-label="拿取方式"><button data-action="mode" data-mode="split">不同色</button><button data-action="mode" data-mode="pair">同色 ×2</button></div>
+        <button class="primary" data-action="collect">确认拿取</button>
       </div>
-      <div class="panel">
-        <div class="tabs">
-          <button class="tab ${createActive ? 'active' : ''}" data-action="show-create">创建房间</button>
-          <button class="tab ${!createActive ? 'active' : ''}" data-action="show-join">加入房间</button>
-        </div>
-        ${
-          createActive
-            ? `
-          <form class="form-stack" data-form="create">
-            <div class="field">
-              <label for="create-name">你的昵称</label>
-              <input id="create-name" name="name" maxlength="20" autocomplete="off" value="${escapeHtml(localStorage.getItem('splendor_name') || '')}" required />
-            </div>
-            <div class="field">
-              <label for="max-players">房间人数</label>
-              <select id="max-players" name="maxPlayers">
-                <option value="2">2 人</option>
-                <option value="3">3 人</option>
-                <option value="4" selected>4 人</option>
-              </select>
-            </div>
-            <button class="primary" type="submit">创建房间</button>
-          </form>
-          `
-            : `
-          <form class="form-stack" data-form="join">
-            <div class="field">
-              <label for="join-name">你的昵称</label>
-              <input id="join-name" name="name" maxlength="20" autocomplete="off" value="${escapeHtml(localStorage.getItem('splendor_name') || '')}" required />
-            </div>
-            <div class="field">
-              <label for="room-code">房间码</label>
-              <input id="room-code" name="roomId" maxlength="8" autocomplete="off" placeholder="例如：1A2B3C4D" required />
-            </div>
-            <button class="primary" type="submit">加入房间</button>
-          </form>
-          `
-        }
-      </div>
+      <div id="return-area"></div>
+      <div id="my-stock" class="my-stock"></div>
     </section>
-  `;
-}
-
-function renderWaitingRoom() {
-  const host = state.players.find((player) => player.id === state.hostId);
-  const canStart = state.youId === state.hostId && state.players.length >= 2;
-
-  app.innerHTML = `
-    <section class="screen lobby">
-      <div class="panel">
-        <div class="space-between">
-          <div>
-            <div class="muted small">房间码</div>
-            <div class="room-code">${escapeHtml(state.roomId)}</div>
-          </div>
-          <button class="ghost" data-action="copy-room">复制房间码</button>
-        </div>
-
-        <div class="player-list">
-          ${state.players.map((player) => `
-            <div class="player-list-item">
-              <div>
-                <strong>${escapeHtml(player.name)}</strong>
-                ${player.id === state.hostId ? '<span class="host-tag">房主</span>' : ''}
-                ${player.id === state.youId ? '<span class="muted small">（你）</span>' : ''}
-              </div>
-              <div class="muted small">等待中</div>
-            </div>
-          `).join('')}
-        </div>
-
-        <div class="row" style="margin-top: 18px;">
-          <button class="primary" data-action="start-game" ${canStart ? '' : 'disabled'}>
-            ${state.youId === state.hostId ? '开始游戏' : `等待房主 ${escapeHtml(host?.name || '')} 开始`}
-          </button>
-          <button class="danger ghost" data-action="leave-room">退出房间</button>
-        </div>
-        <p class="muted small" style="margin-bottom: 0;">
-          将房间码分享给好友，好友选择“加入房间”即可加入。房间人数：${state.players.length}/${state.maxPlayers}。
-        </p>
-      </div>
+    <section class="board" aria-labelledby="board-title">
+      <div class="section-head"><h2 id="board-title">工坊</h2><span class="muted">制作获得永久折扣</span></div>
+      ${[1, 2, 3].map(level => `<section class="tier" aria-label="${LEVEL[level]}作品">
+        <div id="deck-${level}" class="deck"></div>
+        ${[0, 1, 2].map(slot => `<div id="work-${level}-${slot}" class="card-slot"></div>`).join('')}
+      </section>`).join('')}
     </section>
-  `;
-}
+    <section class="panel commissions"><div class="section-head"><h2>商会委托</h2><span class="muted">达到作品要求后，可用一回合交付</span></div><div class="orders" id="orders"></div></section>
+    <section class="panel portfolio"><div class="section-head"><h2>我的保留</h2><span class="muted" id="reserved-count"></span></div><div class="reserved" id="reserved"></div></section>
+    <details class="rules"><summary>玩法</summary><p>每回合取两枚不同色宝石、从至少有 4 枚的同色堆取两枚、保留一张牌、制作一件作品或交付一份委托。宝石库只剩一种颜色且不足 4 枚时可取一枚。</p><p>保留给 1 枚金砂（库存充足时），金砂可代替任意颜色。每人最多持有 9 枚宝石、保留 2 张牌。每件作品提供一种颜色的永久折扣。有人达到 16 分时打完本轮，最高分获胜，同分共享胜利。</p></details>`);
 
-function renderGame() {
-  const me = you();
-  const current = currentPlayer();
-  const isMyTurn = isYourTurn();
-  const canAct = isMyTurn && !hasPendingForYou();
-
-  app.innerHTML = `
-    <section class="screen game">
-      <div class="game-header">
-        <div>
-          <span class="muted small">房间 ${escapeHtml(state.roomId)}</span>
-          <span class="turn-chip ${isMyTurn ? 'current' : ''}">
-            ${state.status === 'finished'
-              ? '对局结束'
-              : `当前回合：${escapeHtml(current?.name || '')}${isMyTurn ? '（你）' : ''}`}
-          </span>
-          ${state.finalRound ? '<span class="turn-chip">最后一轮</span>' : ''}
-        </div>
-        <div class="row">
-          <button class="ghost" data-action="copy-room">复制房间码</button>
-          <button class="ghost danger" data-action="leave-room">退出</button>
-        </div>
-      </div>
-
-      <div class="players-grid">
-        ${state.players.map((player) => renderPlayerCard(player)).join('')}
-      </div>
-
-      <div class="panel board-section">
-        <div class="section-title">
-          <span>贵族板块</span>
-        </div>
-        <div class="noble-row">
-          ${state.nobles.length
-            ? state.nobles.map((noble) => `
-                <div class="noble-card" style="background-image:url('${noble.image}')">
-                  <div class="noble-points">${noble.points}</div>
-                  <div class="card-costs">${costBadges(noble.cost)}</div>
-                </div>
-              `).join('')
-            : '<span class="muted small">贵族已被全部迎走</span>'}
-        </div>
-
-        <div class="section-title" style="margin-top: 20px;">
-          <span>宝石供应区</span>
-          <span class="muted small">${isMyTurn ? '你的回合' : '等待其他玩家操作'}</span>
-        </div>
-        <div class="bank-row">
-          ${TOKEN_COLORS.map((color) => `
-            <button
-              class="bank-pile ${isGemSelected(color) ? 'selected' : ''}"
-              data-action="bank-token"
-              data-color="${color}"
-              ${isBankSelectable(color) ? '' : 'disabled'}
-              style="text-align:center;"
-            >
-              <img class="bank-gem" src="/assets/gem-${color}.svg" alt="" />
-              <span class="bank-count">${state.bank[color]}</span>
-            </button>
-          `).join('')}
-        </div>
-        ${!hasPendingForYou() ? renderGemActions(me, canAct) : ''}
-      </div>
-
-      ${[3, 2, 1].map((level) => renderLevel(level, canAct)).join('')}
-
-      ${renderMyPanel(me, canAct)}
-      ${renderPendingNoble(me)}
-      ${renderWinnerOverlay()}
-    </section>
-  `;
-}
-
-function renderPlayerCard(player) {
-  const active = player.id === state.currentPlayerId && state.status === 'playing';
-  const isYou = player.id === state.youId;
-  return `
-    <div class="player-card ${active ? 'active' : ''} ${isYou ? 'you' : ''}">
-      <div class="player-head">
-        <div>
-          <span class="player-name">${escapeHtml(player.name)}</span>
-          ${isYou ? '<span class="muted small">（你）</span>' : ''}
-          ${player.id === state.hostId ? '<span class="host-tag">房主</span>' : ''}
-        </div>
-        <div class="score-badge">${player.score}</div>
-      </div>
-      <div class="player-stat">
-        <div class="player-stat-label">宝石</div>
-        <div class="token-line">
-          ${tokensToChips(player.tokens, { small: true })}
-        </div>
-      </div>
-      <div class="player-stat">
-        <div class="player-stat-label">加成</div>
-        <div class="token-line">
-          ${GEM_COLORS.map((color) => {
-            const count = player.bonuses[color] || 0;
-            if (!count) return '';
-            return `<span class="token-chip ${tokenClass(color)} small"><img class="gem-icon" src="/assets/gem-${color}.svg" alt="" /><span class="chip-count">×${count}</span></span>`;
-          }).join('') || '<span class="muted small">—</span>'}
-        </div>
-      </div>
-      <div class="player-meta">
-        <span class="token-chip small">保留 ${player.reservedCount}</span>
-        <span class="token-chip small">贵族 ${player.nobles.length}</span>
-      </div>
-      ${player.nobles.length
-        ? `<div class="token-line">${player.nobles.map((noble) => `<span class="token-chip token-gold small">贵族 ${noble.points}</span>`).join('')}</div>`
-        : ''}
-    </div>
-  `;
-}
-
-function isBankSelectable(color) {
-  if (!state || state.status !== 'playing') return false;
-  if (!isYourTurn()) return false;
-  if (hasPendingForYou()) return false;
-
-  if (ui.mode === 'take3') {
-    return GEM_COLORS.includes(color) && state.bank[color] > 0;
+  const current = state.players.find(player => player.id === state.currentId);
+  const winners = state.players.filter(player => state.winnerIds.includes(player.id)).map(player => player.name);
+  update('status', `<div><strong>${state.status === 'finished' ? (winners.length ? esc(winners.join('、')) + ' 获胜' : '对局已结束') : myTurn() ? '你的回合' : esc(current.name) + ' 的回合'}</strong>
+    <span>${esc(state.lastMove || '选择宝石，或从工坊开始。')}</span></div>
+    ${state.status === 'finished' ? `<button data-action="leave" ${disabled(busy)}>返回大厅</button>` : `<div class="turn-options"><span class="turn-index">${state.finalRound ? '最后一轮 · ' : ''}第 ${state.turn} 回合</span><button class="quiet" data-action="leave" ${disabled(busy)}>退出</button></div>`}`);
+  document.querySelector('#status').classList.toggle('your-turn', myTurn());
+  const player = you();
+  for (const level of [1, 2, 3]) {
+    update('deck-' + level, `<strong>${LEVEL[level]}</strong><span>${state.deckCounts[level]} 张</span>
+      <button data-action="reserve-deck" data-level="${level}" aria-label="保留${LEVEL[level]}牌堆顶牌" ${disabled(!canAct() || !state.deckCounts[level] || player.reservedCount >= 2)}>保留暗牌</button>`);
+    state.market[level].forEach((card, slot) => {
+      update(`work-${level}-${slot}`, card ? cardHTML(card) : '<div class="empty-card">牌堆已空</div>');
+    });
   }
-  if (ui.mode === 'take2') {
-    return GEM_COLORS.includes(color) && state.bank[color] >= 4;
+  update('orders', state.commissions.map(card => {
+    const eligible = COLORS.every(color => player.bonuses[color] >= (card.cost[color] || 0));
+    return `<article class="order jewel-${card.color}"><div><strong>${esc(card.name)}</strong><span class="points">+${card.points} 分</span></div>
+      <div class="fees">${costs(card.cost)}</div>
+      <button data-action="commission" data-card="${card.id}" ${disabled(!canAct() || !eligible)}>交付</button></article>`;
+  }).join('') || '<p class="empty">所有委托都已完成。</p>');
+  update('reserved-count', `${player.reservedCount} / 2`);
+  update('reserved', player.reserved.map(card => cardHTML(card, true)).join('') || '<p class="empty">还没有保留作品。</p>');
+  const held = Object.values(player.tokens).reduce((total, amount) => total + amount, 0);
+  update('my-stock', `<strong>持有 ${held} / 9</strong><div id="stock-tokens" class="fees">${costs(player.tokens)}</div><strong>折扣</strong><div id="stock-bonuses" class="fees">${costs(player.bonuses)}</div>`);
+
+  for (const card of [...Object.values(state.market).flat().filter(Boolean), ...player.reserved]) {
+    const element = document.getElementById('card-' + card.id);
+    const missing = COLORS.reduce((sum, color) => sum + Math.max(0, (card.cost[color] || 0) - player.bonuses[color] - player.tokens[color]), 0);
+    element.querySelector('[data-action="craft"]').disabled = !canAct() || missing > player.tokens.gold;
+    const reserve = element.querySelector('[data-action="reserve"]');
+    if (reserve) reserve.disabled = !canAct() || player.reservedCount >= 2;
   }
-  // 没有选择行动时，直接点击宝石进入“拿 3 枚不同色”的选择流程。
-  return GEM_COLORS.includes(color) && state.bank[color] > 0;
+  renderSupply();
 }
 
-function isGemSelected(color) {
-  if (ui.mode === 'take2') {
-    return ui.selectedGems[0] === color;
-  }
-  return ui.selectedGems.includes(color);
+function costs(values) {
+  return ALL_COLORS.filter(color => values[color] > 0).map(color =>
+    `<span class="fee" data-color="${color}" title="${LABEL[color]} ${values[color]}" aria-label="${LABEL[color]} ${values[color]}">${gem(color)}<b>${values[color]}</b></span>`
+  ).join('') || '<span class="muted">—</span>';
 }
 
-function renderLevel(level, canAct) {
-  const cards = state.faceUp[level] || [];
-  const deckCount = state.deckCounts[level] || 0;
-  const me = you();
-
-  return `
-    <div class="level-section">
-      <div class="section-title">
-        <span>${LEVEL_LABELS[level]}</span>
-        <span class="muted small">牌堆剩余 ${deckCount}</span>
-      </div>
-      <div class="cards-row">
-        ${cards.map((card) => renderCard(card, canAct, me)).join('')}
-        <div class="deck-card" style="background-image:url('/assets/decks/deck${level}.jpg')">
-          <div class="deck-count">${deckCount}</div>
-          <button
-            data-action="reserve-deck"
-            data-level="${level}"
-            ${canAct && me.reservedCount < 3 && deckCount > 0 ? '' : 'disabled'}
-          >保留牌堆顶牌</button>
-        </div>
-      </div>
+function cardHTML(card, reserved = false) {
+  return `<article id="card-${card.id}" class="work jewel-${card.color} variant-${card.variant} work-level-${card.level}">
+    <div class="work-face">
+      <div class="work-art" aria-hidden="true"><i class="inlay"></i>${gem(card.color)}</div>
+      <div class="work-title"><span class="work-bonus" title="${LABEL[card.color]}折扣">${gem(card.color)} <span>折扣 +1</span></span><span class="points">+${card.points} 分</span></div>
+      <strong class="work-name">${esc(card.name)}</strong>
+      <div class="fees" aria-label="制作费用">${costs(card.cost)}</div>
     </div>
-  `;
+    <div class="work-actions"><button data-action="craft" data-card="${card.id}">制作</button>
+      ${reserved ? '' : `<button data-action="reserve" data-card="${card.id}">保留</button>`}</div>
+  </article>`;
 }
 
-function renderCard(card, canAct, me) {
-  const affordable = canAfford(card, me);
-  const selected = ui.mode === 'reserve' && ui.selectedGems.includes(card.id);
-
-  return `
-    <div class="card-slot">
-      <div class="card level-${card.level} card-photo ${selected ? 'selected' : ''}" style="background-image:url('${card.image}')"></div>
-      ${
-        canAct
-          ? `
-          <div class="card-actions">
-            <button data-action="buy-card" data-card-id="${card.id}" ${affordable ? '' : 'disabled'}>购买</button>
-            <button data-action="reserve-card" data-card-id="${card.id}" ${me.reservedCount < 3 ? '' : 'disabled'}>保留</button>
-          </div>
-          `
-          : ''
-      }
-    </div>
-  `;
-}
-
-function renderMyPanel(me, canAct) {
-  const pendingDiscardForYou = state.pendingDiscard?.playerId === state.youId;
-
-  return `
-    <div class="panel my-panel">
-      <div class="section-title">
-        <span>我的手牌</span>
-        <span class="muted small">宝石 ${sumTokens(me.tokens)} / 10</span>
-      </div>
-      <div class="hand-gems">
-        ${TOKEN_COLORS.map((color) => `
-          <div class="hand-gem">
-            <img class="gem-icon" src="/assets/gem-${color}.svg" alt="" />
-            <span class="hand-gem-count">${me.tokens[color] || 0}</span>
-            <span class="hand-gem-label">${COLOR_LABELS[color]}宝石</span>
-          </div>
-        `).join('')}
-      </div>
-      ${pendingDiscardForYou ? renderDiscardPicker(me) : ''}
-      <div class="section-title" style="margin-top: 18px;">
-        <span>我保留的卡牌</span>
-        <span class="muted small">${me.reservedCount} / 3</span>
-      </div>
-      <div class="reserved-list">
-        ${me.reserved.length
-          ? me.reserved.map((card) => renderReservedCard(card, me, canAct)).join('')
-          : '<span class="muted small">尚未保留卡牌。</span>'}
-      </div>
-    </div>
-  `;
-}
-
-function renderGemActions(me, canAct) {
-  const canConfirmGems =
-    (ui.mode === 'take3' && ui.selectedGems.length === 3)
-    || (ui.mode === 'take2' && ui.selectedGems.length === 2);
-
-  return `
-    <div class="gem-actions">
-      <div class="action-buttons compact">
-        <button
-          class="${ui.mode === 'take3' ? 'active' : ''}"
-          data-action="take-three"
-          ${canAct && canTakeThree() ? '' : 'disabled'}
-        >拿 3 枚不同色</button>
-        <button
-          class="${ui.mode === 'take2' ? 'active' : ''}"
-          data-action="take-two"
-          ${canAct && canTakeTwo() ? '' : 'disabled'}
-        >拿 2 枚同色</button>
-        <button
-          class="ghost"
-          data-action="cancel-mode"
-          ${ui.mode ? '' : 'disabled'}
-        >取消选择</button>
-      </div>
-      <div class="selection-help">
-        ${ui.mode ? selectionHelpText() : '点击上方宝石可直接开始选择；也可购买或保留发展卡。'}
-      </div>
-      ${canConfirmGems ? `
-        <button class="primary" data-action="confirm-gems">确认拿取</button>
-      ` : ''}
-    </div>
-  `;
-}
-
-function renderDiscardPicker(me) {
-  const needed = state.pendingDiscard?.count || 0;
-  return `
-    <div class="panel" style="margin-top: 14px; background: rgba(15, 28, 43, 0.72);">
-      <div class="section-title">
-        <span>选择要归还的宝石</span>
-        <span class="muted small">已选 ${ui.returnSelection.length} / ${needed}</span>
-      </div>
-      <div class="bank-row">
-        ${TOKEN_COLORS.map((color) => {
-          const available = me.tokens[color] - countInArray(ui.returnSelection, color);
-          return `
-            <button
-              class="bank-pile"
-              data-action="return-token"
-              data-color="${color}"
-              ${available > 0 && ui.returnSelection.length < needed ? '' : 'disabled'}
-            >
-              <span class="bank-count">${me.tokens[color]}</span>
-              <span class="token-chip ${tokenClass(color)} small">${COLOR_LABELS[color]}</span>
-            </button>
-          `;
-        }).join('')}
-      </div>
-      <button
-        class="primary"
-        data-action="confirm-return"
-        style="margin-top: 12px;"
-        ${ui.returnSelection.length === needed ? '' : 'disabled'}
-      >确认归还</button>
-    </div>
-  `;
-}
-
-function renderReservedCard(card, me, canAct) {
-  const affordable = canAfford(card, me);
-  return `
-    <div class="card-slot">
-      <div class="card level-${card.level} card-photo" style="background-image:url('${card.image}')"></div>
-      ${
-        canAct
-          ? `
-          <div class="card-actions">
-            <button data-action="buy-reserved" data-card-id="${card.id}" ${affordable ? '' : 'disabled'}>购买</button>
-          </div>
-          `
-          : ''
-      }
-    </div>
-  `;
-}
-
-function renderPendingNoble(me) {
-  if (!state.pendingNoble || state.pendingNoble.playerId !== state.youId) return '';
-
-  const options = state.nobles.filter((noble) =>
-    state.pendingNoble.optionIds.includes(noble.id)
-  );
-
-  return `
-    <div class="overlay">
-      <div class="panel overlay-panel">
-        <h2>有贵族来访</h2>
-        <p>你的发展卡加成满足了多位贵族，请选择迎接一位。</p>
-        <div class="noble-row" style="justify-content: center;">
-          ${options.map((noble) => `
-            <button class="noble-card" data-action="choose-noble" data-noble-id="${noble.id}" style="background-image:url('${noble.image}')">
-              <div class="noble-points">${noble.points}</div>
-              <div class="card-costs">${costBadges(noble.cost)}</div>
-            </button>
-          `).join('')}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function renderWinnerOverlay() {
-  if (state.status !== 'finished' || !state.winner) return '';
-
-  const winners = state.players
-    .filter((player) => state.winner.includes(player.id))
-    .map((player) => escapeHtml(player.name))
-    .join('、');
-  const won = state.winner.includes(state.youId);
-
-  return `
-    <div class="overlay">
-      <div class="panel overlay-panel">
-        <h2>${won ? '你获胜了！' : '对局结束'}</h2>
-        <p>胜利者：${winners}</p>
-        <div class="player-list">
-          ${state.players
-            .slice()
-            .sort((a, b) => b.score - a.score || a.cards.length - b.cards.length)
-            .map((player) => `
-              <div class="player-list-item">
-                <strong>${escapeHtml(player.name)}</strong>
-                <span>${player.score} 分 · ${player.cards.length} 张卡</span>
-              </div>
-            `).join('')}
-        </div>
-        <button class="primary" data-action="new-room" style="margin-top: 16px;">返回大厅</button>
-      </div>
-    </div>
-  `;
-}
-
-function selectionHelpText() {
-  if (ui.mode === 'take3') {
-    return `已选择 ${ui.selectedGems.length}/3 枚不同色宝石，点击上方供应区宝石选择，然后确认。`;
-  }
-  if (ui.mode === 'take2') {
-    const color = ui.selectedGems[0];
-    return color
-      ? `已选择 ${COLOR_LABELS[color]}宝石 2 枚，点击确认拿取。`
-      : '选择一种库存至少 4 枚的宝石，一次拿取 2 枚。';
-  }
-  return '';
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
-}
-
-async function handleCreate(form) {
-  const name = form.elements.name.value.trim();
-  const maxPlayers = Number(form.elements.maxPlayers.value);
-  if (!name) {
-    showToast('请输入昵称', true);
+function renderSupply() {
+  const open = canAct();
+  const pairAvailable = COLORS.some(color => state.bank[color] >= 4);
+  const splitAvailable = COLORS.filter(color => state.bank[color] > 0).length;
+  const required = selectionMode === 'split' && splitAvailable === 1 && !pairAvailable ? 1 : 2;
+  const selectedCount = selectionMode === 'pair' && selection.length ? 2 : selection.length;
+  document.querySelectorAll('.pile').forEach(button => {
+    const { color } = button.dataset;
+    const active = selection.includes(color);
+    button.disabled = !open || color === 'gold' || state.bank[color] < (selectionMode === 'pair' ? 4 : 1)
+      || (selectionMode === 'split' && splitAvailable < 2 && pairAvailable);
+    button.setAttribute('aria-pressed', active);
+    button.querySelector('strong').textContent = state.bank[color] - (active ? (selectionMode === 'pair' ? 2 : 1) : 0);
+  });
+  document.querySelectorAll('[data-action="mode"]').forEach(button => {
+    button.disabled = !open || (button.dataset.mode === 'pair' ? !pairAvailable : splitAvailable < 2 && pairAvailable);
+    button.setAttribute('aria-pressed', selectionMode === button.dataset.mode);
+  });
+  document.querySelector('[data-action="collect"]').disabled = !open || selectedCount !== required;
+  update('supply-hint', open ? `已选 ${selectedCount} / ${required}` : state.returnCount && myTurn() ? '需要归还宝石' : '');
+  const area = document.querySelector('#return-area');
+  if (!myTurn() || !state.returnCount) {
+    update('return-area', '');
     return;
   }
-
-  localStorage.setItem('splendor_name', name);
-  const data = await api('/api/rooms', {
-    method: 'POST',
-    body: { name, maxPlayers }
+  update('return-area', `<div class="return-box"><strong>归还 ${state.returnCount} 枚宝石 <span id="return-count"></span></strong>
+    <div class="return-piles">${ALL_COLORS.map(color => `<button data-action="return-gem" data-color="${color}" aria-label="归还${LABEL[color]}">${gem(color)} <span></span></button>`).join('')}</div>
+    <div class="return-actions"><button data-action="clear-return">重选</button><button class="primary" data-action="return">确认归还</button></div></div>`);
+  area.querySelector('#return-count').textContent = `（已选 ${returns.length}）`;
+  const player = you();
+  area.querySelectorAll('[data-action="return-gem"]').forEach(button => {
+    const available = player.tokens[button.dataset.color] - count(returns, button.dataset.color);
+    button.querySelector('span').textContent = available;
+    button.disabled = busy || !connected || !available || returns.length === state.returnCount;
   });
-  saveSession(data.roomId, data.playerId);
-  state = data.state;
-  connectEvents();
-  render();
+  area.querySelector('[data-action="return"]').disabled = busy || !connected || returns.length !== state.returnCount;
 }
 
-async function handleJoin(form) {
-  const name = form.elements.name.value.trim();
-  const roomId = form.elements.roomId.value.trim().toUpperCase();
-  if (!name || !roomId) {
-    showToast('请输入昵称和房间码', true);
-    return;
+function appendMessages(messages, replay = false) {
+  const list = document.querySelector('#messages');
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+  let scroll = nearBottom;
+  for (const message of messages) {
+    if (message.id <= lastMessageId) continue;
+    const own = message.playerId === state?.youId;
+    const row = document.createElement('article');
+    row.className = own ? 'message own' : 'message';
+    row.innerHTML = '<div><strong></strong><time></time></div><p></p>';
+    row.querySelector('strong').textContent = own ? '我' : message.name;
+    row.querySelector('time').textContent = timeFormat.format(message.time);
+    row.querySelector('p').textContent = message.text;
+    list.querySelector('.empty')?.remove();
+    list.append(row);
+    if (list.children.length > 100) list.firstElementChild.remove();
+    if (!replay && !own && !desktop.matches && !mobileChatOpen) unread += 1;
+    if (own) scroll = true;
+    lastMessageId = message.id;
   }
+  if (scroll) list.scrollTop = list.scrollHeight;
+  updateUnread();
+}
 
-  localStorage.setItem('splendor_name', name);
-  const data = await api(`/api/rooms/${encodeURIComponent(roomId)}/join`, {
-    method: 'POST',
-    body: { name }
+function updateUnread() {
+  const badge = document.querySelector('#unread');
+  badge.hidden = !unread;
+  badge.textContent = unread > 99 ? '99+' : unread;
+}
+
+function connect() {
+  stream?.close();
+  const source = new EventSource(roomPath('events') + '?key=' + encodeURIComponent(session.key));
+  stream = source;
+  source.addEventListener('open', () => {
+    if (stream !== source) return;
+    connected = true;
+    renderRoom();
   });
-  saveSession(data.roomId, data.playerId);
-  state = data.state;
-  connectEvents();
-  render();
-}
-
-async function startGame() {
-  const data = await api(`/api/rooms/${encodeURIComponent(session.roomId)}/start`, {
-    method: 'POST',
-    body: { playerId: session.playerId }
+  source.addEventListener('state', event => {
+    if (stream === source) acceptState(JSON.parse(event.data));
   });
-  state = data.state;
-  render();
-}
-
-async function sendAction(action) {
-  const data = await api(`/api/rooms/${encodeURIComponent(session.roomId)}/action`, {
-    method: 'POST',
-    body: { playerId: session.playerId, action }
+  source.addEventListener('history', event => {
+    if (stream === source) appendMessages(JSON.parse(event.data), lastMessageId === 0);
   });
-  state = data.state;
-  render();
-}
-
-async function copyRoom() {
-  try {
-    await navigator.clipboard.writeText(state.roomId);
-    showToast('房间码已复制');
-  } catch {
-    showToast(`房间码：${state.roomId}`);
-  }
-}
-
-async function leaveRoom() {
-  clearSession();
-  if (eventSource) eventSource.close();
-  eventSource = null;
-  state = null;
-  render();
-}
-
-function selectBankToken(color) {
-  if (!isYourTurn() || hasPendingForYou()) return;
-
-  if (!ui.mode) {
-    ui.mode = 'take3';
-    ui.selectedGems = [color];
-    render();
-    return;
-  }
-
-  if (ui.mode === 'take3') {
-    if (!GEM_COLORS.includes(color)) return;
-    const index = ui.selectedGems.indexOf(color);
-    if (index >= 0) {
-      ui.selectedGems.splice(index, 1);
-    } else if (ui.selectedGems.length < 3) {
-      ui.selectedGems.push(color);
+  source.addEventListener('chat', event => {
+    if (stream === source) appendMessages([JSON.parse(event.data)]);
+  });
+  source.onerror = () => {
+    if (stream !== source) return;
+    connected = false;
+    renderRoom();
+    if (source.readyState === EventSource.CLOSED) {
+      notify('房间连接已关闭。请刷新页面重试。', true);
     }
-    render();
-  } else if (ui.mode === 'take2') {
-    if (!GEM_COLORS.includes(color) || state.bank[color] < 4) return;
-    ui.selectedGems = [color, color];
-    render();
-  }
+  };
 }
 
-async function confirmGems() {
-  if (ui.mode === 'take3' && ui.selectedGems.length === 3) {
-    await sendAction({ type: 'takeGems', colors: ui.selectedGems });
-  } else if (ui.mode === 'take2' && ui.selectedGems.length === 2) {
-    await sendAction({ type: 'takeGems', colors: ui.selectedGems });
-  }
+function remember(data, name) {
+  session = { roomId: data.roomId, key: data.key };
+  localStorage.setItem('guild_room', data.roomId);
+  localStorage.setItem('guild_key', data.key);
+  localStorage.setItem('guild_name', name);
+  if (invite) history.replaceState(null, '', '/');
+  mountRoom();
+  acceptState(data.state);
+  connect();
 }
 
-async function selectReturnToken(color) {
-  const me = you();
-  const needed = state.pendingDiscard?.count || 0;
-  const index = ui.returnSelection.indexOf(color);
-  if (index >= 0) {
-    ui.returnSelection.splice(index, 1);
-  } else if (ui.returnSelection.length < needed && (me.tokens[color] || 0) > countInArray(ui.returnSelection, color)) {
-    ui.returnSelection.push(color);
-  }
-  render();
+function resetRoom() {
+  stream?.close();
+  stream = null;
+  state = null;
+  session = null;
+  connected = false;
+  busy = false;
+  chatBusy = false;
+  localStorage.removeItem('guild_room');
+  localStorage.removeItem('guild_key');
+  lobbyTab = 'create';
+  history.replaceState(null, '', '/');
+  renderLobby();
 }
 
-function countInArray(array, value) {
-  return array.filter((item) => item === value).length;
-}
-
-async function confirmReturnTokens() {
-  const needed = state.pendingDiscard?.count || 0;
-  if (ui.returnSelection.length !== needed) return;
-  await sendAction({ type: 'returnTokens', colors: ui.returnSelection });
-}
-
-async function chooseNoble(nobleId) {
-  await sendAction({ type: 'chooseNoble', nobleId });
-}
-
-app.addEventListener('submit', async (event) => {
-  const form = event.target.closest('form[data-form]');
-  if (!form) return;
-  event.preventDefault();
-
+async function roomCommand(command, body = {}) {
+  if (busy) return;
+  busy = true;
+  renderRoom();
   try {
-    if (form.dataset.form === 'create') {
-      await handleCreate(form);
-    } else if (form.dataset.form === 'join') {
-      await handleJoin(form);
+    const result = await api(roomPath(command), body, session.key);
+    if (command === 'leave') resetRoom();
+    else acceptState(result.state);
+  } finally {
+    busy = false;
+    if (state) renderRoom();
+  }
+}
+
+async function submitChat(form) {
+  if (chatBusy || !connected) return;
+  const field = form.elements.message;
+  const original = field.value;
+  if (!original.trim()) return;
+  chatBusy = true;
+  showConnection();
+  try {
+    // The stream owns ordering. Rendering the POST response could skip earlier messages.
+    await api(roomPath('chat'), { text: original }, session.key);
+    if (field.value === original) field.value = '';
+  } finally {
+    chatBusy = false;
+    showConnection();
+  }
+}
+
+app.addEventListener('submit', async event => {
+  const form = event.target;
+  event.preventDefault();
+  try {
+    if (form.dataset.form === 'chat') {
+      await submitChat(form);
+      return;
+    }
+    if (joining) return;
+    const name = form.elements.name.value.trim();
+    if (!name) return notify('请输入昵称。', true);
+    joining = true;
+    form.querySelector('button[type="submit"]').disabled = true;
+    try {
+      const data = form.dataset.form === 'create'
+        ? await api('/api/rooms', { name, capacity: Number(form.elements.capacity.value) })
+        : await api('/api/rooms/' + encodeURIComponent(form.elements.room.value.trim().toUpperCase()) + '/join', { name });
+      remember(data, name);
+    } finally {
+      joining = false;
+      form.querySelector('button[type="submit"]').disabled = false;
     }
   } catch (error) {
-    showToast(error.message, true);
+    notify(error.message, true);
   }
 });
 
-app.addEventListener('click', async (event) => {
-  const target = event.target.closest('[data-action]');
-  if (!target) return;
+function toggleChat() {
+  mobileChatOpen = !mobileChatOpen;
+  const chat = document.querySelector('#chat');
+  const toggle = document.querySelector('.chat-toggle');
+  chat.classList.toggle('open', mobileChatOpen);
+  toggle.setAttribute('aria-expanded', mobileChatOpen);
+  if (mobileChatOpen) {
+    unread = 0;
+    updateUnread();
+    const list = document.querySelector('#messages');
+    list.scrollTop = list.scrollHeight;
+    chat.querySelector('.chat-close').focus();
+  } else toggle.focus();
+}
 
-  const action = target.dataset.action;
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && mobileChatOpen && !desktop.matches) toggleChat();
+});
 
+async function inviteFriend() {
+  const url = new URL('/', location.href);
+  url.searchParams.set('room', session.roomId);
   try {
-    if (action === 'show-create') {
-      ui.tab = 'create';
-      render();
-    } else if (action === 'show-join') {
-      ui.tab = 'join';
-      render();
-    } else if (action === 'copy-room') {
-      await copyRoom();
-    } else if (action === 'start-game') {
-      await startGame();
-    } else if (action === 'leave-room') {
-      await leaveRoom();
-    } else if (action === 'new-room') {
-      await leaveRoom();
-    } else if (action === 'take-three') {
-      ui.mode = 'take3';
-      ui.selectedGems = [];
-      render();
-    } else if (action === 'take-two') {
-      ui.mode = 'take2';
-      ui.selectedGems = [];
-      render();
-    } else if (action === 'cancel-mode') {
-      ui.mode = null;
-      ui.selectedGems = [];
-      render();
-    } else if (action === 'bank-token') {
-      selectBankToken(target.dataset.color);
-    } else if (action === 'confirm-gems') {
-      await confirmGems();
-    } else if (action === 'buy-card') {
-      await sendAction({
-        type: 'buyCard',
-        payload: { cardId: target.dataset.cardId }
-      });
-    } else if (action === 'buy-reserved') {
-      await sendAction({
-        type: 'buyCard',
-        payload: { cardId: target.dataset.cardId }
-      });
-    } else if (action === 'reserve-card') {
-      await sendAction({
-        type: 'reserveCard',
-        payload: { source: 'faceUp', cardId: target.dataset.cardId }
-      });
-    } else if (action === 'reserve-deck') {
-      await sendAction({
-        type: 'reserveCard',
-        payload: { source: 'deck', level: Number(target.dataset.level) }
-      });
-    } else if (action === 'choose-noble') {
-      await chooseNoble(target.dataset.nobleId);
-    } else if (action === 'return-token') {
-      selectReturnToken(target.dataset.color);
-    } else if (action === 'confirm-return') {
-      await confirmReturnTokens();
+    await navigator.clipboard.writeText(url.href);
+    notify('邀请链接已复制。');
+  } catch {
+    window.prompt('复制邀请链接', url.href);
+  }
+}
+
+app.addEventListener('click', async event => {
+  const button = event.target.closest('button[data-action]');
+  if (!button || button.disabled) return;
+  const { action, color, card, mode, level, tab } = button.dataset;
+  try {
+    const play = payload => roomCommand('action', { revision: state.revision, action: payload });
+    switch (action) {
+      case 'music': await toggleMusic(); break;
+      case 'tab':
+        if (!joining) {
+          lobbyTab = tab;
+          renderLobby(document.querySelector('#nickname').value);
+          document.querySelector(`[data-tab="${tab}"]`).focus();
+        }
+        break;
+      case 'invite': await inviteFriend(); break;
+      case 'chat-toggle': toggleChat(); break;
+      case 'start': await roomCommand('start'); break;
+      case 'leave':
+        if (state.status !== 'playing' || window.confirm('退出会结束本局。确定退出吗？')) await roomCommand('leave');
+        break;
+      case 'mode':
+        if (selectionMode !== mode) {
+          selectionMode = mode;
+          selection = [];
+          renderSupply();
+        }
+        break;
+      case 'gem':
+        if (selection.includes(color)) selection = selection.filter(item => item !== color);
+        else if (selectionMode === 'pair') selection = [color];
+        else selection = [...selection.slice(-1), color];
+        renderSupply();
+        break;
+      case 'collect':
+        await play({ type: 'collect', colors: selectionMode === 'pair' ? [selection[0], selection[0]] : selection });
+        break;
+      case 'return-gem': returns.push(color); renderSupply(); break;
+      case 'clear-return': returns = []; renderSupply(); break;
+      case 'return': await play({ type: 'return', colors: returns }); break;
+      case 'craft':
+      case 'commission':
+      case 'reserve': await play({ type: action, cardId: card }); break;
+      case 'reserve-deck': await play({ type: 'reserve', level: Number(level) }); break;
     }
   } catch (error) {
-    showToast(error.message, true);
+    notify(error.message, true);
   }
 });
 
 async function boot() {
-  if (!session.roomId || !session.playerId) {
-    state = null;
-    render();
+  if (!session?.roomId || !session.key) {
+    renderLobby();
     return;
   }
-
-  app.innerHTML = `
-    <section class="screen lobby">
-      <div class="hero"><h1>璀璨宝石</h1><p>正在重新连接房间…</p></div>
-    </section>
-  `;
-
+  renderLobby(undefined, true);
   try {
-    const data = await api(
-      `/api/rooms/${encodeURIComponent(session.roomId)}?playerId=${encodeURIComponent(session.playerId)}`
-    );
-    state = data.state;
-    connectEvents();
-    render();
+    const result = await api(roomPath(), undefined, session.key);
+    mountRoom();
+    acceptState(result.state);
+    connect();
   } catch (error) {
-    clearSession();
-    state = null;
-    render();
-    showToast(error.message, true);
+    if ([403, 404].includes(error.status)) resetRoom();
+    else {
+      renderLobby();
+      notify('暂时无法恢复房间。刷新页面可重试。', true);
+      return;
+    }
+    notify(error.message, true);
   }
 }
 

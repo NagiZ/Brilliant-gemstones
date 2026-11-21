@@ -1,382 +1,216 @@
 'use strict';
 
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const { SplendorGame } = require('./lib/game');
+const http = require('node:http');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const { randomBytes, randomUUID } = require('node:crypto');
+const { GuildGame } = require('./lib/game');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const CHAT_LIMIT = 100;
+const MESSAGE_LIMIT = 300;
+const CHAT_INTERVAL = 400;
 const rooms = new Map();
+const files = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/client.js', ['client.js', 'text/javascript; charset=utf-8']],
+  ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
+  ['/media/late-workshop.webp', ['media/late-workshop.webp', 'image/webp']],
+  ['/media/workshop-at-night.mp3', ['media/workshop-at-night.mp3', 'audio/mpeg']]
+]);
 
-function sendJson(res, statusCode, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(statusCode, {
+async function serveFile(req, res, [name, type]) {
+  const content = await fs.readFile(path.join(PUBLIC_DIR, name));
+  const headers = {
+    'Content-Type': type,
+    'Content-Length': content.length,
+    'Cache-Control': 'no-cache'
+  };
+  if (type === 'audio/mpeg') {
+    headers['Accept-Ranges'] = 'bytes';
+    if (req.method === 'GET' && req.headers.range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
+      const first = match?.[1];
+      const last = match?.[2];
+      const start = first ? Number(first) : Math.max(0, content.length - Number(last));
+      const end = first && last ? Math.min(Number(last), content.length - 1) : content.length - 1;
+      if ((!first && !last) || start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${content.length}` });
+        return res.end();
+      }
+      headers['Content-Range'] = `bytes ${start}-${end}/${content.length}`;
+      headers['Content-Length'] = end - start + 1;
+      res.writeHead(206, headers);
+      return res.end(content.subarray(start, end + 1));
+    }
+  }
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : content);
+}
+
+function json(res, status, payload) {
+  res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store'
   });
-  res.end(body);
+  res.end(JSON.stringify(payload));
 }
 
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 1024 * 1024) {
-        reject(new Error('请求体过大'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => {
-      if (!body) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(body));
-      } catch (error) {
-        reject(new Error('无效的 JSON'));
-      }
-    });
-    req.on('error', reject);
-  });
+async function readBody(req) {
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of req) {
+    length += chunk.length;
+    if (length > 8192) {
+      const error = new Error('请求内容过长。');
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (body && typeof body === 'object' && !Array.isArray(body)) return body;
+  } catch {
+    // Invalid requests are reported below.
+  }
+  const error = new Error('请求格式无效。');
+  error.status = 400;
+  throw error;
 }
 
-function normalizeName(name) {
-  return String(name || '').trim().slice(0, 20);
-}
-
-function normalizeMaxPlayers(value) {
-  const number = Number(value);
-  return Number.isInteger(number) && number >= 2 && number <= 4 ? number : 4;
+function event(res, type, data) {
+  res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function broadcastState(room) {
-  for (const player of room.players) {
-    const clients = room.sseClients.get(player.id);
-    if (!clients || clients.size === 0) continue;
-    const state = room.viewForPlayer(player.id);
-    const data = `event: state\ndata: ${JSON.stringify(state)}\n\n`;
-    for (const res of clients) {
-      res.write(data);
-    }
-  }
+  for (const [res, id] of room.streams) event(res, 'state', room.game.view(id));
 }
 
-function subscribeToRoom(room, playerId, req, res) {
+function subscribe(room, id, res) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
   res.write(': connected\n\n');
-  res.write(`event: state\ndata: ${JSON.stringify(room.viewForPlayer(playerId))}\n\n`);
+  room.streams.set(res, id);
+  event(res, 'state', room.game.view(id));
+  event(res, 'history', room.messages);
 
-  if (!room.sseClients.has(playerId)) {
-    room.sseClients.set(playerId, new Set());
-  }
-  room.sseClients.get(playerId).add(res);
-
-  const heartbeat = setInterval(() => {
-    res.write(': heartbeat\n\n');
-  }, 15000);
-
-  req.on('close', () => {
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
+  res.on('close', () => {
     clearInterval(heartbeat);
-    const clients = room.sseClients.get(playerId);
-    if (clients) {
-      clients.delete(res);
-      if (clients.size === 0) room.sseClients.delete(playerId);
-    }
+    room.streams.delete(res);
   });
 }
 
-function getRoomPlayer(req, res, roomId, playerId) {
-  const room = rooms.get(roomId);
-  if (!room) {
-    sendJson(res, 404, { error: '房间不存在或已关闭。' });
-    return null;
+function sendMessage(room, member, body, res) {
+  const text = typeof body.text === 'string' ? body.text.trim() : '';
+  if (!text || text.length > MESSAGE_LIMIT) {
+    return json(res, 400, { error: '请输入 1 至 300 字的消息。' });
+  }
+  const now = Date.now();
+  if (now - member.lastMessage < CHAT_INTERVAL) {
+    return json(res, 429, { error: '发送太快，请稍后再试。' });
   }
 
-  const player = room.playerById(playerId);
-  if (!player) {
-    sendJson(res, 403, { error: '你不是该房间的玩家。' });
-    return null;
-  }
-
-  return { room, player };
+  member.lastMessage = now;
+  const message = { id: ++room.messageId, playerId: member.id, name: member.name, text, time: now };
+  room.messages.push(message);
+  if (room.messages.length > CHAT_LIMIT) room.messages.shift();
+  for (const stream of room.streams.keys()) event(stream, 'chat', message);
+  json(res, 201, { message });
 }
 
-function serveStatic(req, res, urlPath) {
-  const requested = urlPath === '/' ? '/index.html' : urlPath;
-  const decoded = decodeURIComponent(requested);
-  const filePath = path.normalize(path.join(PUBLIC_DIR, decoded));
+async function enter(room, roomId, req, res) {
+  const body = await readBody(req);
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 20) return json(res, 400, { error: '昵称须为 1 至 20 字。' });
 
-  if (!filePath.startsWith(PUBLIC_DIR)) {
-    sendJson(res, 403, { error: '禁止访问。' });
-    return;
-  }
-
-  fs.readFile(filePath, (error, content) => {
-    if (error) {
-      sendJson(res, 404, { error: '页面不存在。' });
-      return;
-    }
-
-    const ext = path.extname(filePath).toLowerCase();
-    const mimeTypes = {
-      '.html': 'text/html; charset=utf-8',
-      '.js': 'text/javascript; charset=utf-8',
-      '.css': 'text/css; charset=utf-8',
-      '.json': 'application/json; charset=utf-8',
-      '.svg': 'image/svg+xml',
-      '.png': 'image/png',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.ico': 'image/x-icon'
+  const id = randomUUID();
+  const key = randomBytes(24).toString('hex');
+  const creating = !room;
+  if (creating) {
+    do {
+      roomId = randomBytes(4).toString('hex').toUpperCase();
+    } while (rooms.has(roomId));
+    const capacity = [2, 3, 4].includes(body.capacity) ? body.capacity : 4;
+    room = {
+      game: new GuildGame(roomId, id, name, capacity),
+      members: new Map(),
+      streams: new Map(),
+      messages: [],
+      messageId: 0
     };
-
-    res.writeHead(200, {
-      'Content-Type': mimeTypes[ext] || 'application/octet-stream',
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300'
-    });
-    res.end(content);
-  });
+    rooms.set(roomId, room);
+  } else {
+    if (rooms.get(roomId) !== room) return json(res, 404, { error: '房间不存在或已关闭。' });
+    const result = room.game.addPlayer(id, name);
+    if (result.error) return json(res, 409, result);
+  }
+  room.members.set(key, { id, name, lastMessage: 0 });
+  broadcastState(room);
+  json(res, creating ? 201 : 200, { roomId, key, state: room.game.view(id) });
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const route = url.pathname;
+async function handle(req, res) {
+  const url = new URL(req.url, 'http://localhost');
   const method = req.method;
-  const segments = route.split('/').filter(Boolean);
+  const file = files.get(url.pathname);
+  if (file && (method === 'GET' || method === 'HEAD')) return serveFile(req, res, file);
+  if (method === 'GET' && url.pathname === '/api/health') return json(res, 200, { ok: true });
+  if (method === 'POST' && url.pathname === '/api/rooms') return enter(null, null, req, res);
 
-  try {
-    if (method === 'GET' && route === '/api/health') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
+  const route = /^\/api\/rooms\/([A-F0-9]{8})(?:\/([a-z]+))?$/i.exec(url.pathname);
+  if (!route) return json(res, 404, { error: '地址不存在。' });
+  const [, code, command] = route;
+  const roomId = code.toUpperCase();
+  const room = rooms.get(roomId);
+  if (!room) return json(res, 404, { error: '房间不存在或已关闭。' });
+  if (method === 'POST' && command === 'join') return enter(room, roomId, req, res);
 
-    if (method === 'POST' && route === '/api/rooms') {
-      const body = await readJsonBody(req);
-      const name = normalizeName(body.name);
-      const maxPlayers = normalizeMaxPlayers(body.maxPlayers);
-      if (!name) {
-        sendJson(res, 400, { error: '请输入昵称。' });
-        return;
-      }
+  const streaming = method === 'GET' && command === 'events';
+  const key = streaming ? url.searchParams.get('key') : req.headers.authorization?.replace(/^Bearer /, '');
+  const member = room.members.get(key);
+  if (!member) return json(res, 403, { error: '房间会话已失效。' });
+  if (streaming) return subscribe(room, member.id, res);
+  if (method === 'GET' && !command) return json(res, 200, { state: room.game.view(member.id) });
+  if (method !== 'POST') return json(res, 404, { error: '地址不存在。' });
 
-      const roomId = crypto.randomBytes(4).toString('hex').toUpperCase();
-      const playerId = crypto.randomUUID();
-      const room = new SplendorGame(roomId, playerId, name, maxPlayers);
-      room.sseClients = new Map();
-      rooms.set(roomId, room);
-      sendJson(res, 201, {
-        roomId,
-        playerId,
-        state: room.viewForPlayer(playerId)
-      });
-      return;
-    }
+  const body = await readBody(req);
+  if (!room.members.has(key)) return json(res, 403, { error: '房间会话已失效。' });
+  if (command === 'chat') return sendMessage(room, member, body, res);
 
-    if (
-      method === 'POST'
-      && segments.length === 4
-      && segments[0] === 'api'
-      && segments[1] === 'rooms'
-      && segments[3] === 'join'
-    ) {
-      const roomId = segments[2];
-      const body = await readJsonBody(req);
-      const name = normalizeName(body.name);
-      const room = rooms.get(roomId);
-      if (!room) {
-        sendJson(res, 404, { error: '房间不存在或已关闭。' });
-        return;
-      }
-      if (!name) {
-        sendJson(res, 400, { error: '请输入昵称。' });
-        return;
-      }
-
-      const playerId = crypto.randomUUID();
-      const result = room.addPlayer(playerId, name);
-      if (!result.ok) {
-        sendJson(res, 409, { error: result.error });
-        return;
-      }
-
-      broadcastState(room);
-      sendJson(res, 200, {
-        roomId,
-        playerId,
-        state: room.viewForPlayer(playerId)
-      });
-      return;
-    }
-
-    if (
-      method === 'GET'
-      && segments.length === 4
-      && segments[0] === 'api'
-      && segments[1] === 'rooms'
-      && segments[3] === 'events'
-    ) {
-      const roomId = segments[2];
-      const playerId = url.searchParams.get('playerId') || '';
-      const room = rooms.get(roomId);
-      if (!room) {
-        sendJson(res, 404, { error: '房间不存在或已关闭。' });
-        return;
-      }
-      const player = room.playerById(playerId);
-      if (!player) {
-        sendJson(res, 403, { error: '你不是该房间的玩家。' });
-        return;
-      }
-      subscribeToRoom(room, playerId, req, res);
-      return;
-    }
-
-    if (
-      method === 'GET'
-      && segments.length === 3
-      && segments[0] === 'api'
-      && segments[1] === 'rooms'
-    ) {
-      const roomId = segments[2];
-      const playerId = url.searchParams.get('playerId') || '';
-      const found = getRoomPlayer(req, res, roomId, playerId);
-      if (!found) return;
-      sendJson(res, 200, { state: found.room.viewForPlayer(playerId) });
-      return;
-    }
-
-    if (
-      method === 'POST'
-      && segments.length === 4
-      && segments[0] === 'api'
-      && segments[1] === 'rooms'
-      && segments[3] === 'start'
-    ) {
-      const roomId = segments[2];
-      const body = await readJsonBody(req);
-      const playerId = String(body.playerId || '');
-      const found = getRoomPlayer(req, res, roomId, playerId);
-      if (!found) return;
-
-      if (playerId !== found.room.hostId) {
-        sendJson(res, 403, { error: '只有房主可以开始游戏。' });
-        return;
-      }
-
-      const result = found.room.start();
-      if (!result.ok) {
-        sendJson(res, 409, { error: result.error });
-        return;
-      }
-      broadcastState(found.room);
-      sendJson(res, 200, { state: found.room.viewForPlayer(playerId) });
-      return;
-    }
-
-    if (
-      method === 'POST'
-      && segments.length === 4
-      && segments[0] === 'api'
-      && segments[1] === 'rooms'
-      && segments[3] === 'action'
-    ) {
-      const roomId = segments[2];
-      const body = await readJsonBody(req);
-      const playerId = String(body.playerId || '');
-      const found = getRoomPlayer(req, res, roomId, playerId);
-      if (!found) return;
-
-      const { room, player } = found;
-      if (room.status !== 'playing') {
-        sendJson(res, 409, { error: '游戏尚未开始或已经结束。' });
-        return;
-      }
-      if (room.currentPlayerId !== playerId) {
-        sendJson(res, 409, { error: '还没轮到你操作。' });
-        return;
-      }
-
-      const action = body.action || {};
-      let result;
-
-      switch (action.type) {
-        case 'takeGems':
-          result = room.takeGems(player, action.colors);
-          if (result.ok) {
-            const overflow = Object.values(player.tokens).reduce((a, b) => a + b, 0) - 10;
-            if (overflow > 0) {
-              room.pendingDiscard = { playerId: player.id, count: overflow };
-            } else {
-              room.endTurn(player);
-            }
-          }
-          break;
-
-        case 'returnTokens':
-          result = room.returnTokens(player, action.colors);
-          if (result.ok) {
-            room.endTurnAfterDiscard(player);
-          }
-          break;
-
-        case 'reserveCard':
-          result = room.reserveCard(player, action.payload);
-          if (result.ok) {
-            const overflow = Object.values(player.tokens).reduce((a, b) => a + b, 0) - 10;
-            if (overflow > 0) {
-              room.pendingDiscard = { playerId: player.id, count: overflow };
-            } else {
-              room.endTurn(player);
-            }
-          }
-          break;
-
-        case 'buyCard':
-          result = room.buyCard(player, action.payload);
-          if (result.ok) {
-            room.endTurn(player);
-          }
-          break;
-
-        case 'chooseNoble':
-          result = room.chooseNoble(player, action.nobleId);
-          break;
-
-        default:
-          result = { ok: false, error: '未知操作。' };
-      }
-
-      if (!result.ok) {
-        sendJson(res, 409, { error: result.error });
-        return;
-      }
-
-      broadcastState(room);
-      sendJson(res, 200, { state: room.viewForPlayer(playerId) });
-      return;
-    }
-
-    if (method === 'GET') {
-      serveStatic(req, res, route);
-      return;
-    }
-
-    sendJson(res, 404, { error: '接口不存在。' });
-  } catch (error) {
-    const message = error && error.message ? error.message : '服务器内部错误';
-    sendJson(res, 500, { error: message });
+  let result;
+  switch (command) {
+    case 'start': result = room.game.start(member.id); break;
+    case 'action': result = room.game.play(member.id, body.revision, body.action); break;
+    case 'leave': result = room.game.leave(member.id); break;
+    default: return json(res, 404, { error: '地址不存在。' });
   }
-});
+  if (result.error) return json(res, 409, result);
+  if (command === 'leave') {
+    room.members.delete(key);
+    for (const [stream, id] of room.streams) {
+      if (id === member.id) {
+        room.streams.delete(stream);
+        stream.end();
+      }
+    }
+    if (!room.members.size) rooms.delete(roomId);
+    broadcastState(room);
+    return json(res, 200, { ok: true });
+  }
+  broadcastState(room);
+  json(res, 200, { state: room.game.view(member.id) });
+}
 
-server.listen(PORT, () => {
-  console.log(`璀璨宝石服务器已启动：http://localhost:${PORT}`);
-});
+http.createServer((req, res) => {
+  handle(req, res).catch(error => {
+    if (!res.headersSent) json(res, error.status || 500, { error: error.status ? error.message : '服务器暂时无法处理请求。' });
+    else res.end();
+    if (!error.status) console.error(error);
+  });
+}).listen(PORT, () => console.log(`棱境商会已启动 http://localhost:${PORT}`));
