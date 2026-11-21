@@ -41,6 +41,7 @@ const gem = color => `<i class="gem gem-${color}" aria-hidden="true"></i>`;
 const you = () => state.players.find(player => player.id === state.youId);
 const myTurn = () => state?.status === 'playing' && state.currentId === state.youId;
 const canAct = () => myTurn() && !state.returnCount && connected && !busy;
+const reserveLimit = () => state.reserveLimit ?? 2;
 const count = (colors, color) => colors.filter(item => item === color).length;
 const disabled = value => value ? 'disabled' : '';
 const roomPath = (command = '') => `/api/rooms/${session.roomId}${command ? '/' + command : ''}`;
@@ -139,8 +140,13 @@ function mountRoom() {
   unread = 0;
   mobileChatOpen = false;
   app.innerHTML = `
-    <header class="site-header">
+    <header class="site-header room-header">
       <div class="header-inner">${brand()}
+        <div id="header-turn" class="header-turn" hidden>
+          <span class="header-turn-mark" aria-hidden="true"></span>
+          <span id="header-turn-status" role="status" aria-atomic="true"></span>
+          <a class="turn-jump" href="#supply-title" hidden>前往宝石库</a>
+        </div>
         <div class="header-actions">
           <span id="connection" role="status"></span>
           ${musicControl()}
@@ -183,6 +189,7 @@ function showConnection() {
 
 function acceptState(next) {
   if (state && next.revision <= state.revision) return;
+  const justFinished = state?.status === 'playing' && next.status === 'finished' && next.winnerIds.length > 0;
   const transfers = captureTransfers(state, next);
   selection = [];
   selectionMode = 'split';
@@ -190,6 +197,57 @@ function acceptState(next) {
   state = next;
   renderRoom();
   transfers.forEach(animateTransfer);
+  if (justFinished) celebrateVictory();
+}
+
+function winnerNames() {
+  return state.players.filter(player => state.winnerIds.includes(player.id)).map(player => player.name);
+}
+
+function renderHeaderTurn() {
+  const header = document.querySelector('#header-turn');
+  const mine = myTurn();
+  const finished = state.status === 'finished';
+  header.hidden = state.status === 'waiting';
+  header.classList.toggle('your-turn', mine);
+  header.classList.toggle('has-winner', finished && state.winnerIds.length > 0);
+  header.querySelector('.turn-jump').hidden = !mine;
+  if (header.hidden) return;
+
+  const player = state.players.find(item => item.id === state.currentId);
+  const names = winnerNames();
+  const label = finished ? (names.length ? `${names.join('、')} 获胜` : '对局已结束')
+    : mine ? '轮到你了' : `轮到 ${player.name}`;
+  const detail = mine && state.returnCount ? `归还 ${state.returnCount} 枚宝石`
+    : !finished && state.finalRound ? '最后一轮' : '';
+  update('header-turn-status', `<strong>${esc(label)}</strong>${detail ? `<small>${esc(detail)}</small>` : ''}`);
+}
+
+function celebrateVictory() {
+  const layer = document.createElement('div');
+  const winners = winnerNames();
+  const ownWin = state.winnerIds.includes(state.youId);
+  const accentColors = ['#ffda9c', '#aef3cd', '#b5a8ff', '#ff9cb3', '#a1dcf8'];
+  const confetti = reducedMotion.matches ? '' : Array.from({ length: 45 }, (_, index) => {
+    const from = (index + Math.random()) * 100 / 45;
+    const drift = Math.round(Math.random() * 28 - 14);
+    const delay = Math.round(Math.random() * 700);
+    const duration = Math.round(2150 + Math.random() * 1250);
+    const size = Math.round(6 + Math.random() * 9);
+    const spin = (index % 2 ? 1 : -1) * (220 + index * 12);
+    return `<i class="victory-flake" style="--from:${from}%;--drift:${drift}vw;--delay:${delay}ms;--duration:${duration}ms;--size:${size}px;--spin:${spin}deg;--flake:${accentColors[index % accentColors.length]}"></i>`;
+  }).join('');
+  const title = winners.length > 1 ? '共同获胜' : ownWin ? '你赢了！' : '胜者揭晓';
+  layer.className = 'victory-layer';
+  // The sticky turn indicator already announces the final result.
+  layer.setAttribute('aria-hidden', 'true');
+  layer.innerHTML = `${confetti}<div class="victory-card">
+    <div class="victory-gems">${gem('blue')}${gem('gold')}${gem('green')}</div>
+    <strong>${title}</strong>
+    <span>${esc(winners.join('、'))}</span>
+  </div>`;
+  app.append(layer);
+  setTimeout(() => layer.remove(), 4900);
 }
 
 function captureTransfers(before, after) {
@@ -283,6 +341,7 @@ function animateTransfer({ kind, piece, from, destination, color }, index) {
 function renderRoom() {
   showConnection();
   if (!state) return;
+  renderHeaderTurn();
   update('seat-count', `${state.players.length} / ${state.capacity}`);
   update('players', state.players.map(player => `
     <div id="seat-${esc(player.id)}" class="seat ${player.id === state.currentId ? 'active' : ''}">
@@ -314,14 +373,29 @@ function renderRoom() {
   }
 
   update('table', `
-    <div id="status" class="turn-banner"></div>
+    <div class="turn-section">
+      <div id="status" class="turn-banner"></div>
+      <details id="turn-history" class="turn-history">
+        <summary>回合历史 <span id="history-count"></span></summary>
+        <div class="history-body">
+          <p class="empty history-note" role="status">还没有回合操作。</p>
+          <ol class="history-entries"></ol>
+          <button class="quiet history-retry" data-action="history-retry" hidden>重试</button>
+        </div>
+      </details>
+    </div>
     <section class="panel supply" aria-labelledby="supply-title">
-      <div class="section-head"><h2 id="supply-title">宝石库</h2><span class="muted" id="supply-hint"></span></div>
+      <div class="section-head"><h2 id="supply-title">宝石库</h2><span class="muted" id="supply-capacity"></span></div>
       <div id="piles" class="piles">${ALL_COLORS.map(color => `<button data-action="gem" data-color="${color}" class="pile" aria-pressed="false">${gem(color)}<span>${LABEL[color]}</span><strong>0</strong></button>`).join('')}</div>
       <div class="supply-controls">
-        <div class="modes" aria-label="拿取方式"><button data-action="mode" data-mode="split">不同色</button><button data-action="mode" data-mode="pair">同色 ×2</button></div>
-        <button class="primary" data-action="collect">确认拿取</button>
+        <div class="modes" aria-label="拿取方式">
+          <button data-action="mode" data-mode="split">不同色 ×${state.distinctPickLimit}</button>
+          <button data-action="mode" data-mode="pair">同色 ×2</button>
+        </div>
+        <button class="primary" data-action="collect" aria-describedby="supply-hint supply-warning">确认拿取</button>
       </div>
+      <p class="muted supply-note" id="supply-hint" role="status"></p>
+      <p class="supply-warning" id="supply-warning" role="status" hidden></p>
       <div id="return-area"></div>
       <div id="my-stock" class="my-stock"></div>
     </section>
@@ -334,18 +408,21 @@ function renderRoom() {
     </section>
     <section class="panel commissions"><div class="section-head"><h2>商会委托</h2><span class="muted">达到作品要求后，可用一回合交付</span></div><div class="orders" id="orders"></div></section>
     <section class="panel portfolio"><div class="section-head"><h2>我的保留</h2><span class="muted" id="reserved-count"></span></div><div class="reserved" id="reserved"></div></section>
-    <details class="rules"><summary>玩法</summary><p>每回合取两枚不同色宝石、从至少有 4 枚的同色堆取两枚、保留一张牌、制作一件作品或交付一份委托。宝石库只剩一种颜色且不足 4 枚时可取一枚。</p><p>保留给 1 枚金砂（库存充足时），金砂可代替任意颜色。每人最多持有 9 枚宝石、保留 2 张牌。每件作品提供一种颜色的永久折扣。有人达到 16 分时打完本轮，最高分获胜，同分共享胜利。</p></details>`);
+    <details class="rules"><summary>玩法</summary><p>每回合可取 ${state.distinctPickLimit} 枚不同色宝石、从至少有 ${state.sameColorPileMin} 枚的同色堆取 2 枚、保留一张牌、制作一件作品或交付一份委托。宝石库剩余颜色不足 ${state.distinctPickLimit} 种时，取现有的每种各 1 枚。</p><p>最多保留 ${reserveLimit()} 张牌。保留时若宝石库还有金砂，可拿 1 枚来代替任意颜色。回合结束时最多持有 ${state.tokenLimit} 枚筹码，金砂也计入总数。每件作品提供一种颜色的永久折扣。有人达到 16 分时打完本轮，最高分获胜，同分共享胜利。</p></details>`);
 
   const current = state.players.find(player => player.id === state.currentId);
-  const winners = state.players.filter(player => state.winnerIds.includes(player.id)).map(player => player.name);
+  const winners = winnerNames();
   update('status', `<div><strong>${state.status === 'finished' ? (winners.length ? esc(winners.join('、')) + ' 获胜' : '对局已结束') : myTurn() ? '你的回合' : esc(current.name) + ' 的回合'}</strong>
     <span>${esc(state.lastMove || '选择宝石，或从工坊开始。')}</span></div>
     ${state.status === 'finished' ? `<button data-action="leave" ${disabled(busy)}>返回大厅</button>` : `<div class="turn-options"><span class="turn-index">${state.finalRound ? '最后一轮 · ' : ''}第 ${state.turn} 回合</span><button class="quiet" data-action="leave" ${disabled(busy)}>退出</button></div>`}`);
   document.querySelector('#status').classList.toggle('your-turn', myTurn());
+  update('history-count', state.historyCount);
+  void loadTurnHistory(document.querySelector('#turn-history'));
   const player = you();
+  const canReserve = canAct() && player.reservedCount < reserveLimit();
   for (const level of [1, 2, 3]) {
     update('deck-' + level, `<strong>${LEVEL[level]}</strong><span>${state.deckCounts[level]} 张</span>
-      <button data-action="reserve-deck" data-level="${level}" aria-label="保留${LEVEL[level]}牌堆顶牌" ${disabled(!canAct() || !state.deckCounts[level] || player.reservedCount >= 2)}>保留暗牌</button>`);
+      <button data-action="reserve-deck" data-level="${level}" aria-label="保留${LEVEL[level]}牌堆顶牌" ${disabled(!canReserve || !state.deckCounts[level])}>保留暗牌</button>`);
     state.market[level].forEach((card, slot) => {
       update(`work-${level}-${slot}`, card ? cardHTML(card) : '<div class="empty-card">牌堆已空</div>');
     });
@@ -356,20 +433,55 @@ function renderRoom() {
       <div class="fees">${costs(card.cost)}</div>
       <button data-action="commission" data-card="${card.id}" ${disabled(!canAct() || !eligible)}>交付</button></article>`;
   }).join('') || '<p class="empty">所有委托都已完成。</p>');
-  update('reserved-count', `${player.reservedCount} / 2`);
+  update('reserved-count', `${player.reservedCount} / ${reserveLimit()}`);
   update('reserved', player.reserved.map(card => cardHTML(card, true)).join('') || '<p class="empty">还没有保留作品。</p>');
-  const held = Object.values(player.tokens).reduce((total, amount) => total + amount, 0);
-  update('my-stock', `<strong>持有 ${held} / 9</strong><div id="stock-tokens" class="fees">${costs(player.tokens)}</div><strong>折扣</strong><div id="stock-bonuses" class="fees">${costs(player.bonuses)}</div>`);
+  update('my-stock', `<strong>我的宝石</strong><div id="stock-tokens" class="fees">${costs(player.tokens)}</div><strong>折扣</strong><div id="stock-bonuses" class="fees">${costs(player.bonuses)}</div>`);
 
   for (const card of [...Object.values(state.market).flat().filter(Boolean), ...player.reserved]) {
     const element = document.getElementById('card-' + card.id);
     const missing = COLORS.reduce((sum, color) => sum + Math.max(0, (card.cost[color] || 0) - player.bonuses[color] - player.tokens[color]), 0);
     element.querySelector('[data-action="craft"]').disabled = !canAct() || missing > player.tokens.gold;
     const reserve = element.querySelector('[data-action="reserve"]');
-    if (reserve) reserve.disabled = !canAct() || player.reservedCount >= 2;
+    if (reserve) reserve.disabled = !canReserve;
   }
   renderSupply();
 }
+
+async function loadTurnHistory(panel) {
+  const offset = panel.historyOffset || 0;
+  if (!panel.open || panel.historyLoading || offset >= state.historyCount) return;
+  panel.historyLoading = true;
+  const note = panel.querySelector('.history-note');
+  const retry = panel.querySelector('.history-retry');
+  retry.hidden = true;
+  note.hidden = offset > 0;
+  note.textContent = '正在加载回合记录…';
+  let received = 0;
+  try {
+    const { entries } = await api(roomPath('history') + '?after=' + offset, undefined, session.key);
+    if (!panel.isConnected) return;
+    received = entries.length;
+    panel.historyOffset = offset + received;
+    const list = panel.querySelector('.history-entries');
+    list.insertAdjacentHTML('afterbegin', entries.reverse().map(entry => `
+      <li><span class="history-turn">第 ${entry.turn} 回合</span>
+      <span><strong>${esc(entry.playerName)}</strong> ${esc(entry.move)}</span></li>
+    `).join(''));
+    note.hidden = panel.historyOffset > 0;
+    note.textContent = '还没有回合操作。';
+  } catch {
+    note.textContent = '回合记录暂时无法加载。';
+    note.hidden = false;
+    retry.hidden = false;
+  } finally {
+    panel.historyLoading = false;
+    if (panel.isConnected && received && panel.historyOffset < state.historyCount) void loadTurnHistory(panel);
+  }
+}
+
+app.addEventListener('toggle', event => {
+  if (event.target.id === 'turn-history' && event.target.open) void loadTurnHistory(event.target);
+}, true);
 
 function costs(values) {
   return ALL_COLORS.filter(color => values[color] > 0).map(color =>
@@ -382,7 +494,7 @@ function cardHTML(card, reserved = false) {
     <div class="work-face">
       <div class="work-art" aria-hidden="true"><i class="inlay"></i>${gem(card.color)}</div>
       <div class="work-title"><span class="work-bonus" title="${LABEL[card.color]}折扣">${gem(card.color)} <span>折扣 +1</span></span><span class="points">+${card.points} 分</span></div>
-      <strong class="work-name">${esc(card.name)}</strong>
+      <strong class="work-name" title="${esc(card.name)}">${esc(card.name)}</strong>
       <div class="fees" aria-label="制作费用">${costs(card.cost)}</div>
     </div>
     <div class="work-actions"><button data-action="craft" data-card="${card.id}">制作</button>
@@ -390,26 +502,48 @@ function cardHTML(card, reserved = false) {
   </article>`;
 }
 
+function distinctPickCount() {
+  return Math.min(state.distinctPickLimit, COLORS.filter(color => state.bank[color] > 0).length);
+}
+
 function renderSupply() {
   const open = canAct();
-  const pairAvailable = COLORS.some(color => state.bank[color] >= 4);
-  const splitAvailable = COLORS.filter(color => state.bank[color] > 0).length;
-  const required = selectionMode === 'split' && splitAvailable === 1 && !pairAvailable ? 1 : 2;
-  const selectedCount = selectionMode === 'pair' && selection.length ? 2 : selection.length;
+  const pairMode = selectionMode === 'pair';
+  const pairAvailable = COLORS.some(color => state.bank[color] >= state.sameColorPileMin);
+  const required = pairMode ? 2 : distinctPickCount();
+  const selectedCount = pairMode && selection.length ? 2 : selection.length;
   document.querySelectorAll('.pile').forEach(button => {
     const { color } = button.dataset;
     const active = selection.includes(color);
-    button.disabled = !open || color === 'gold' || state.bank[color] < (selectionMode === 'pair' ? 4 : 1)
-      || (selectionMode === 'split' && splitAvailable < 2 && pairAvailable);
+    button.disabled = !open || color === 'gold' || state.bank[color] < (pairMode ? state.sameColorPileMin : 1)
+      || (!pairMode && !active && selectedCount >= required);
     button.setAttribute('aria-pressed', active);
-    button.querySelector('strong').textContent = state.bank[color] - (active ? (selectionMode === 'pair' ? 2 : 1) : 0);
+    button.querySelector('strong').textContent = state.bank[color] - (active ? (pairMode ? 2 : 1) : 0);
   });
   document.querySelectorAll('[data-action="mode"]').forEach(button => {
-    button.disabled = !open || (button.dataset.mode === 'pair' ? !pairAvailable : splitAvailable < 2 && pairAvailable);
+    button.disabled = !open;
     button.setAttribute('aria-pressed', selectionMode === button.dataset.mode);
   });
-  document.querySelector('[data-action="collect"]').disabled = !open || selectedCount !== required;
-  update('supply-hint', open ? `已选 ${selectedCount} / ${required}` : state.returnCount && myTurn() ? '需要归还宝石' : '');
+  document.querySelector('[data-action="collect"]').disabled = !open || !required || selectedCount !== required;
+  const player = you();
+  const held = Object.values(player.tokens).reduce((total, amount) => total + amount, 0);
+  const remaining = Math.max(0, state.tokenLimit - held);
+  update('supply-capacity', `持有 ${held} / ${state.tokenLimit} · ${remaining ? `还可持有 ${remaining} 枚` : '无剩余容量'}`);
+  const hint = document.querySelector('#supply-hint');
+  hint.hidden = !open;
+  const pairHint = selectedCount ? `已选 ${LABEL[selection[0]]} ×2。`
+    : pairAvailable ? `点击一个至少有 ${state.sameColorPileMin} 枚的宝石堆，即选中同色 2 枚。`
+      : `当前没有达到 ${state.sameColorPileMin} 枚的宝石堆，暂时不能拿同色。`;
+  update('supply-hint', pairMode ? pairHint : `选择 ${required} 枚不同色宝石（已选 ${selectedCount} / ${required}）。`);
+  const planned = pairMode && !pairAvailable ? 0 : required;
+  const excess = Math.max(0, held + planned - state.tokenLimit);
+  const warning = document.querySelector('#supply-warning');
+  const reserveWarning = !remaining && player.reservedCount < reserveLimit() && state.bank.gold > 0;
+  warning.hidden = !open || (!excess && !reserveWarning);
+  warning.textContent = [
+    excess ? (selectedCount === required ? `确认拿取后需归还 ${excess} 枚宝石。` : `选满后将超出上限，需要归还 ${excess} 枚宝石。`) : '',
+    reserveWarning ? '保留卡牌得到金砂后也需归还 1 枚。' : ''
+  ].join('');
   const area = document.querySelector('#return-area');
   if (!myTurn() || !state.returnCount) {
     update('return-area', '');
@@ -419,7 +553,6 @@ function renderSupply() {
     <div class="return-piles">${ALL_COLORS.map(color => `<button data-action="return-gem" data-color="${color}" aria-label="归还${LABEL[color]}">${gem(color)} <span></span></button>`).join('')}</div>
     <div class="return-actions"><button data-action="clear-return">重选</button><button class="primary" data-action="return">确认归还</button></div></div>`);
   area.querySelector('#return-count').textContent = `（已选 ${returns.length}）`;
-  const player = you();
   area.querySelectorAll('[data-action="return-gem"]').forEach(button => {
     const available = player.tokens[button.dataset.color] - count(returns, button.dataset.color);
     button.querySelector('span').textContent = available;
@@ -608,6 +741,7 @@ app.addEventListener('click', async event => {
     const play = payload => roomCommand('action', { revision: state.revision, action: payload });
     switch (action) {
       case 'music': await toggleMusic(); break;
+      case 'history-retry': await loadTurnHistory(document.querySelector('#turn-history')); break;
       case 'tab':
         if (!joining) {
           lobbyTab = tab;
@@ -631,7 +765,7 @@ app.addEventListener('click', async event => {
       case 'gem':
         if (selection.includes(color)) selection = selection.filter(item => item !== color);
         else if (selectionMode === 'pair') selection = [color];
-        else selection = [...selection.slice(-1), color];
+        else if (selection.length < distinctPickCount()) selection = [...selection, color];
         renderSupply();
         break;
       case 'collect':

@@ -177,6 +177,11 @@ async function handle(req, res) {
   if (!member) return json(res, 403, { error: '房间会话已失效。' });
   if (streaming) return subscribe(room, member.id, res);
   if (method === 'GET' && !command) return json(res, 200, { state: room.game.view(member.id) });
+  if (method === 'GET' && command === 'history') {
+    const after = Number(url.searchParams.get('after') ?? 0);
+    if (!Number.isSafeInteger(after) || after < 0) return json(res, 400, { error: '回合记录位置无效。' });
+    return json(res, 200, { entries: room.game.history.slice(after) });
+  }
   if (method !== 'POST') return json(res, 404, { error: '地址不存在。' });
 
   const body = await readBody(req);
