@@ -182,7 +182,7 @@ h2 { font-size: 19px; letter-spacing: .035em; }
 .pile span { color: #c2d2c8; font-size: .72rem; white-space: nowrap; }
 .pile strong { font-variant-numeric: tabular-nums; font-size: 1.05rem; line-height: 1; }
 .pile:disabled { opacity: .85; }
-.pile[aria-pressed=true] { background: #344f40; border-color: var(--mint); }
+button.pile[aria-pressed=true] { background: #344f40; border-color: var(--mint); }
 .pile[aria-pressed=true] .gem { transform: rotate(12deg) scale(1.08); }
 .supply-controls, .return-actions { margin-top: 10px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .modes { display: flex; gap: 6px; }
